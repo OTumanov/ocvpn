@@ -7,6 +7,8 @@ PASS=0
 FAIL=0
 TESTS_DIR=$(mktemp -d /tmp/ovpn-tests-XXXXXX)
 export TESTS_DIR
+export TMPDIR="${TESTS_DIR}/tmp"
+mkdir -p "$TMPDIR"
 
 # Загрузить функции скрипта (до main) в текущую оболочку — понадобятся в [2], [3]
 FUNC_LOAD="$TESTS_DIR/load.sh"
@@ -23,6 +25,8 @@ FUNC_H="$TESTS_DIR/func.sh"
 
 # ==== 1. Загрузка функций без запуска main ====
 sed '/# === Main ===/,$d' "$SCRIPT" > "$FUNC_H"
+# убираем trap cleanup (в субшелл [1] rm -rf $TMPDIR убил бы общий каталог)
+printf 'trap - EXIT\n' >> "$FUNC_H"
 cat >> "$FUNC_H" <<'INJECT'
 iptables() { return 0; }
 
@@ -53,8 +57,12 @@ echo "TLS_SNI=$(grep -o '"serverName": "cdn.example.com"' "$TESTS_DIR/cfg/t/conf
 echo "GRPC=$(cfg 'vless://2aa7f4b1-e859-46d0-b8ac-8587811ab7b1@grpc.example:443?encryption=none&security=reality&sni=grpc.example.com&pbk=abc123&sid=1234&type=grpc&serviceName=svc#Grpc' g)"
 echo "GRPC_SVC=$(grep -o '"serviceName": "svc"' "$TESTS_DIR/cfg/g/config.json" | head -1)"
 
-echo "XHTTP=$(cfg 'vless://2aa7f4b1-e859-46d0-b8ac-8587811ab7b1@xh.example:443?encryption=none&security=reality&sni=x.example.com&pbk=abc&type=xhttp&path=%2Fxh#Xh' x)"
+echo "XHTTP=$(cfg 'vless://2aa7f4b1-e859-46d0-b8ac-8587811ab7b1@xh.example:443?encryption=none&security=reality&sni=x.example.com&pbk=abc&type=xhttp&path=%2Fxh&mode=auto#Xh' x)"
 echo "XHTTP_NET=$(grep -o '"network": "xhttp"' "$TESTS_DIR/cfg/x/config.json" | head -1)"
+echo "XHTTP_KEY=$(grep -o '"xhttpSettings"' "$TESTS_DIR/cfg/x/config.json" | head -1)"
+echo "XHTTP_HOST_STR=$(grep -o '"host": "x.example.com"' "$TESTS_DIR/cfg/x/config.json" | head -1)"
+echo "XHTTP_MODE=$(grep -o '"mode": "auto"' "$TESTS_DIR/cfg/x/config.json" | head -1)"
+echo "XHTTP_NO_HTTPKEY=$(grep -c '"httpSettings"' "$TESTS_DIR/cfg/x/config.json")"
 
 echo "BAD_NO_UUID=$(cfg 'vless://@host:443?security=none&type=tcp#bad' b)"
 
@@ -148,26 +156,39 @@ fi
 
 # ==== 3. E2E: подписка + парсинг реального ключа ====
 echo ""
-echo "[3] E2E: подписка + парсинг реальных ключей"
+echo "[3] E2E: подписка (base64/vless) + парсинг реальных ключей"
 SUBS_TEST="$TESTS_DIR/subs.txt"
-curl -fsSL --connect-timeout 10 "https://raw.githubusercontent.com/zxcursedzxc0721/vless-subscriptions/refs/heads/main/ru/vless.txt" -o "$SUBS_TEST" 2>/dev/null \
-    && { PASS=$((PASS+1)); echo "  ▸ подписка скачана: OK"; } \
-    || { FAIL=$((FAIL+1)); echo "  ▸ подписка скачана: FAIL"; }
+# Используем ту же логику загрузки, что и скрипт (env/локальный файл/fallback)
+if download_subscription "$SUBS_TEST" 2>/dev/null; then
+    PASS=$((PASS+1)); echo "  ▸ подписка скачана: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ подписка скачана: FAIL"
+fi
 
 if [[ -s "$SUBS_TEST" ]]; then
     TOTAL=$(grep -cE '^vless://' "$SUBS_TEST")
-    if [[ "$TOTAL" -ge 300 ]]; then
-        PASS=$((PASS+1)); echo "  ▸ vless-ключей >= 300: OK ($TOTAL)"
+    echo "  ▸ vless-ключей: $TOTAL"
+    if [[ "$TOTAL" -ge 5 ]]; then
+        PASS=$((PASS+1)); echo "  ▸ vless-ключей >= 5: OK"
     else
-        FAIL=$((FAIL+1)); echo "  ▸ vless-ключей >= 300: FAIL ($TOTAL)"
+        FAIL=$((FAIL+1)); echo "  ▸ vless-ключей >= 5: FAIL ($TOTAL)"
     fi
 
-    # парсим 5 случайных реальных ключей (все типы) через функцию
-    V5=$(grep -E '^vless://' "$SUBS_TEST" | shuf -n 5 | while IFS= read -r k; do
+    # поддерживаемые ключи должны фильтроваться is_supported_key
+    SUPP=$(grep -E '^vless://' "$SUBS_TEST" | while IFS= read -r k; do is_supported_key "$k" && echo S; done | grep -c . || true)
+    echo "  ▸ поддерживаемых (is_supported_key): $SUPP"
+    if [[ "$SUPP" -ge 1 ]]; then
+        PASS=$((PASS+1)); echo "  ▸ есть поддерживаемые ключи: OK"
+    else
+        FAIL=$((FAIL+1)); echo "  ▸ есть поддерживаемые ключи: FAIL ($SUPP)"
+    fi
+
+    # парсим 5 случайных поддерживаемых реальных ключей через функцию
+    V5=$(grep -E '^vless://' "$SUBS_TEST" | while IFS= read -r k; do is_supported_key "$k" && echo "$k"; done | shuf -n 5 | while IFS= read -r k; do
         d="$TESTS_DIR/v5_$RANDOM"; mkdir -p "$d"
         vless_to_xray "$k" "$d" && python3 -m json.tool "$d/config.json" >/dev/null 2>&1 && echo S || echo F
     done | tr -d '\n')
-    echo "  ▸ проверка 5 случайных ключей: $V5"
+    echo "  ▸ проверка 5 случайных поддерживаемых ключей: $V5"
     if [[ "$V5" == "SSSSS" ]]; then
         PASS=$((PASS+1)); echo "  ▸ парсинг 5 случайных реальных ключей: OK"
     else

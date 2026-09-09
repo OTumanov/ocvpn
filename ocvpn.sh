@@ -2,7 +2,13 @@
 set -euo pipefail
 
 # === Config ===
-SUBS_URL="https://raw.githubusercontent.com/zxcursedzxc0721/vless-subscriptions/refs/heads/main/ru/vless.txt"
+# Приоритет подписки: $OCVPN_SUBS_URL (env) > ~/.ocvpn-subs-url (локальный файл, НЕ в git) > fallback
+SUBS_FALLBACK_URL="https://raw.githubusercontent.com/zxcursedzxc0721/vless-subscriptions/refs/heads/main/ru/vless.txt"
+SUBS_URL="${OCVPN_SUBS_URL:-}"
+if [[ -z "$SUBS_URL" && -s "$HOME/.ocvpn-subs-url" ]]; then
+    SUBS_URL="$(head -n1 "$HOME/.ocvpn-subs-url" 2>/dev/null | tr -d '[:space:]')"
+fi
+SUBS_URL="${SUBS_URL:-$SUBS_FALLBACK_URL}"
 SOCKS_PORT=10808
 HTTP_PORT=10809
 REDIRECT_PORT=12345
@@ -43,7 +49,7 @@ cleanup() {
     if [[ "${KEEP_ROUTES:-0}" != "1" ]]; then
         cleanup_routes
     fi
-    rm -rf "$TMPDIR" 2>/dev/null || true
+    rm -rf "${TMPDIR:-}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -120,9 +126,15 @@ setup_routes() {
     iptables -t nat -N "$IPTABLES_CHAIN" 2>/dev/null || true
 
     # 1) Не трогаем исходящий трафик xray (сам прокси) — иначе петля
+    #    owner --pid-owner поддерживается не везде (iptables-nft/контейнеры) — тогда пропускаем:
+    #    петля исключается и так, т.к. REDIRECT ловит только opencode-IP:443, а xray ходит на IP VPN-сервера.
     local xray_pid="${XRAY_PID:-}"
     if [[ -n "$xray_pid" ]] && [[ -r "/proc/$xray_pid" ]]; then
-        iptables -t nat -A "$IPTABLES_CHAIN" -m owner --pid-owner "$xray_pid" -j RETURN
+        if iptables -t nat -A "$IPTABLES_CHAIN" -m owner --pid-owner "$xray_pid" -j RETURN 2>/dev/null; then
+            log "  исключён трафик самого xray (pid $xray_pid)"
+        else
+            warn "  owner --pid-owner не поддержан ядром (iptables-nft?), правило исключения xray пропущено"
+        fi
     fi
 
     # 2) Не трогаем private/локальные подсети (nginx, контейнеры, докер, ssh admin)
@@ -159,7 +171,7 @@ setup_routes() {
 
 # === Find / auto-install xray ===
 find_xray() {
-    for bin in xray /usr/local/bin/xray /usr/bin/xray "$HOME/xray/xray"; do
+    for bin in xray /usr/local/bin/xray /usr/bin/xray "$HOME/bin/xray" "$HOME/.local/opt/xray/xray" "$HOME/xray/xray"; do
         if command -v "$bin" &>/dev/null || [[ -x "$bin" ]]; then
             XRAY_BIN="$bin"
             return
@@ -213,6 +225,46 @@ find_xray() {
 }
 
 # === Parse vless URL -> xray JSON config ===
+
+# Генерация фрагмента настроек ws/grpc/xhttp для streamSettings.
+# Возвращает ", <newline>  \"<type>Settings\": {...}" либо пусто. Вызывается в $( ) внутри heredoc.
+ws_stream_settings() {
+    [[ "$1" == "ws" ]] || return 0
+    local path="$2" sni="$3"
+    printf ',
+    "wsSettings": {
+        "path": "%s",
+        "headers": {
+            "Host": "%s"
+        }
+    }' "$path" "$sni"
+}
+
+grpc_stream_settings() {
+    [[ "$1" == "grpc" ]] || return 0
+    local service_name="$2"
+    printf ',
+    "grpcSettings": {
+        "serviceName": "%s"
+    }' "$service_name"
+}
+
+# Xray 26: транспорта xhttp использует ключ xhttpSettings (НЕ httpSettings), host — строка (НЕ массив).
+xhttp_stream_settings() {
+    [[ "$1" == "xhttp" ]] || return 0
+    local path="$2" sni="$3" mode="$4"
+    local mode_json=""
+    if [[ -n "$mode" ]]; then
+        mode_json=$(printf ',
+        "mode": "%s"' "$mode")
+    fi
+    printf ',
+    "xhttpSettings": {
+        "path": "%s",
+        "host": "%s"%s
+    }' "$path" "$sni" "$mode_json"
+}
+
 vless_to_xray() {
     local url="$1"
     local tmp="$2"
@@ -275,22 +327,10 @@ vless_to_xray() {
     "realitySettings": {
         "serverName": "$sni",
         "fingerprint": "${fp:-chrome}",
-        "publicKey": "$pbk",
+        "password": "$pbk",
         "shortId": "$sid"
-    }$(if [[ "$type" == "grpc" ]]; then echo ',
-    "grpcSettings": {
-        "serviceName": "'"$serviceName"'"
-    }'; elif [[ "$type" == "ws" ]]; then echo ',
-    "wsSettings": {
-        "path": "'"$path"'",
-        "headers": {
-            "Host": "'"$sni"'"
-        }
-    }'; elif [[ "$type" == "xhttp" ]]; then echo ',
-    "httpSettings": {
-        "path": "'"$path"'",
-        "host": ["'"$sni"'"]
-    }'; fi)
+    }$(xhttp_stream_settings "$type" "$path" "$sni" "$mode")
+    $(grpc_stream_settings "$type" "$serviceName")
 }
 REALITY_EOF
 )
@@ -310,40 +350,18 @@ print('\"alpn\": ['+','.join('\"'+a+'\"' for a in vals)+']')" 2>/dev/null || ech
         "serverName": "$sni",
         "allowInsecure": false$(if [[ -n "$alpn_json" ]]; then echo ",
         $alpn_json"; fi)
-    }$(if [[ "$type" == "ws" ]]; then echo ',
-    "wsSettings": {
-        "path": "'"$path"'",
-        "headers": {
-            "Host": "'"$sni"'"
-        }
-    }'; elif [[ "$type" == "grpc" ]]; then echo ',
-    "grpcSettings": {
-        "serviceName": "'"$serviceName"'"
-    }'; elif [[ "$type" == "xhttp" ]]; then echo ',
-    "httpSettings": {
-        "path": "'"$path"'",
-        "host": ["'"$sni"'"]
-    }'; fi)
+    }$(ws_stream_settings "$type" "$path" "$sni")
+    $(xhttp_stream_settings "$type" "$path" "$sni" "$mode")
+    $(grpc_stream_settings "$type" "$serviceName")
 }
 TLS_EOF
 )
     else
         stream_settings=$(cat <<NONE_EOF
 {
-    "network": "$type"$(if [[ "$type" == "ws" ]]; then echo ',
-    "wsSettings": {
-        "path": "'"$path"'",
-        "headers": {
-            "Host": "'"$sni"'"
-        }
-    }'; elif [[ "$type" == "grpc" ]]; then echo ',
-    "grpcSettings": {
-        "serviceName": "'"$serviceName"'"
-    }'; elif [[ "$type" == "xhttp" ]]; then echo ',
-    "httpSettings": {
-        "path": "'"$path"'",
-        "host": ["'"$sni"'"]
-    }'; fi)
+    "network": "$type"$(ws_stream_settings "$type" "$path" "$sni")
+    $(xhttp_stream_settings "$type" "$path" "$sni" "$mode")
+    $(grpc_stream_settings "$type" "$serviceName")
 }
 NONE_EOF
 )
@@ -391,19 +409,12 @@ NONE_EOF
             "tag": "proxy",
             "protocol": "vless",
             "settings": {
-                "vnext": [
-                    {
-                        "address": "$host",
-                        "port": $port,
-                        "users": [
-                            {
-                                "id": "$uuid",
-                                $flow_str
-                                "encryption": "none"
-                            }
-                        ]
-                    }
-                ]
+                "address": "$host",
+                "port": $port,
+                "id": "$uuid",
+                "encryption": "none",
+                $flow_str
+                "level": 0
             },
             "streamSettings": $stream_settings
         },
@@ -439,14 +450,17 @@ ping_host() {
 }
 
 # === Отбор 10 случайных ключей по короткому TCP-пингу ===
+# Выбираем только vless-ключи тех типов, что умеет vless_to_xray.
 select_candidates() {
     local subs_file="$1"
     local poolfile="$TMPDIR/pool.txt"
-    mapfile -t pool < <(grep -E '^vless://' "$subs_file" | shuf -n "${BATCH_SIZE}" 2>/dev/null)
+    mapfile -t pool < <(grep -E '^vless://' "$subs_file" | while IFS= read -r u; do
+        is_supported_key "$u" && echo "$u"
+    done | shuf -n "${BATCH_SIZE}" 2>/dev/null)
     printf '%s\n' "${pool[@]:-}" > "$poolfile" 2>/dev/null || true
 
     # Параллельный пинг всех 10
-    log "Пингую ${BATCH_SIZE} случайных серверов..."
+    log "Пингую ${BATCH_SIZE} случайных серверов..." >&2
     local results="$TMPDIR/ping_results.txt"
     : > "$results"
     local url host port
@@ -462,6 +476,41 @@ select_candidates() {
 
     # Сортируем по latency, отбрасываем недоступные
     sort -n "$results" | awk '$1 < 99999' | head -n "${MAX_TRIES}"
+}
+
+# === Скачивание подписки с авто-декодированием base64 ===
+# Многие провайдеры (V2Board/Marzban) отдают подписку в base64. Пишем в $1 декодированный текст.
+download_subscription() {
+    local out="$1"
+    local raw="$TMPDIR/sub_raw.$$"
+    curl -fsSL --connect-timeout 10 "$SUBS_URL" -o "$raw" 2>/dev/null || { err "Не удалось скачать подписку"; return 1; }
+
+    # Если это чистый vless-текст — используем как есть
+    if grep -qE '^vless://' "$raw"; then
+        cp "$raw" "$out"
+    else
+        # Пытаемся декодировать base64
+        if base64 -d "$raw" > "$out" 2>/dev/null && grep -qE '^(vless|vmess|ss|trojan)://' "$out"; then
+            log "Подписка в base64 — декодирована."
+        else
+            cp "$raw" "$out"
+        fi
+    fi
+    rm -f "$raw"
+}
+
+# Поддерживаем ли мы тип ключа (только vless-типы, что умеет vless_to_xray)
+is_supported_key() {
+    local url="$1"
+    case "$url" in
+        vless://*tcp*|vless://*type=raw*|vless://*ws*|vless://*grpc*|vless://*xhttp*) ;;
+        *) return 1 ;;
+    esac
+    # xhttp c sing-box extra (packet-up/upstream) пока не поддерживаем в xray
+    case "$url" in
+        *"extra="*) return 1 ;;
+    esac
+    return 0
 }
 
 # === Main ===
@@ -486,7 +535,7 @@ main() {
     # Download subscription
     log "Скачиваю список серверов..."
     local subs_file="$TMPDIR/subs.txt"
-    curl -fsSL --connect-timeout 10 "$SUBS_URL" -o "$subs_file" 2>/dev/null || { err "Не удалось скачать подписку"; exit 1; }
+    download_subscription "$subs_file" || exit 1
 
     local total
     total=$(grep -cE '^vless://' "$subs_file")
@@ -494,7 +543,7 @@ main() {
         err "Нет vless серверов в подписке"
         exit 1
     fi
-    log "Найдено $total серверов."
+    log "Найдено $total серверов (vless)."
 
     # Отбор кандидатов с наименьшим пингом (порция из 10 случайных)
     local candidates
@@ -502,7 +551,9 @@ main() {
 
     if [[ ${#candidates[@]} -eq 0 ]]; then
         err "Ни один из ${BATCH_SIZE} серверов не ответил на ping. Пробую расширенный пул..."
-        mapfile -t candidates < <(grep -E '^vless://' "$subs_file" | shuf | head -n "${MAX_TRIES}" \
+        mapfile -t candidates < <(grep -E '^vless://' "$subs_file" | while IFS= read -r u; do
+            is_supported_key "$u" && echo "$u"
+        done | shuf | head -n "${MAX_TRIES}" \
             | while IFS= read -r url; do
                 host=$(echo "$url" | sed -n 's|^vless://[^@]*@\([^:]*\):.*|\1|p')
                 port=$(echo "$url" | sed -n 's|^vless://[^@]*@[^:]*:\([0-9]*\).*|\1|p')
@@ -513,16 +564,18 @@ main() {
     log "Кандидаты (по пингу):"
     local tried=0
     for cand in "${candidates[@]}"; do
-        ((tried++))
+        tried=$((tried+1))
         local host cport
         host=$(echo "$cand" | awk '{print $2}')
         cport=$(echo "$cand" | awk '{print $3}')
-        # Найти URL по host:port из основного списка
+        # Найти URL по host:port из основного списка (предпочтительно поддерживаемого типа)
         local url=""
-        url=$(grep -m1 -E "^vless://[^@]*@${host}:${cport}\b" "$subs_file" || true)
+        while IFS= read -r u; do
+            if is_supported_key "$u"; then url="$u"; break; fi
+        done < <(grep -E "^vless://[^@]*@${host}:${cport}" "$subs_file" || true)
         if [[ -z "$url" ]]; then
-            # fallback: ищем из рандомного пула
-            url=$(grep -m1 "${host}:${cport}" "$subs_file" || true)
+            # fallback: любой vless с этим host:port
+            url=$(grep -m1 -E "^vless://[^@]*@${host}:${cport}" "$subs_file" || true)
         fi
         [[ -z "$url" ]] && { warn "  нет URL для ${host}:${cport}, пропускаю"; continue; }
 
@@ -550,7 +603,7 @@ main() {
             --proxy "socks5h://127.0.0.1:$SOCKS_PORT" \
             --connect-timeout "$TIMEOUT" \
             --max-time "$TIMEOUT" \
-            "$TEST_URL" 2>/dev/null || echo "000")
+            "$TEST_URL" 2>/dev/null || true)
 
         if [[ "$code" == "204" ]]; then
             log "  РАБОТАЕТ! (HTTP $code)"
