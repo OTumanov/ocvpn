@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# iptables обычно лежит в /usr/sbin или /sbin, которых может не быть в PATH
+# (в частности под sudo/systemd с урезанным PATH). Добавляем, не затирая остальное.
+export PATH="/usr/sbin:/sbin:$PATH"
+
 # === Config ===
 # Приоритет подписки: $OCVPN_SUBS_URL (env) > ~/.ocvpn-subs-url (локальный файл, НЕ в git) > fallback
 SUBS_FALLBACK_URL="https://raw.githubusercontent.com/zxcursedzxc0721/vless-subscriptions/refs/heads/main/ru/vless.txt"
