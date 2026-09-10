@@ -99,12 +99,16 @@ hosts_setup() {
     # убрать старый блок
     sed "/^[^#]*$HOSTS_MARK\$/d" /etc/hosts > "$tmp" 2>/dev/null || cp /etc/hosts "$tmp"
     # собрать IPv4-адреса доменов
-    local ip d
+    local ip d key
     declare -A seen
     for d in "${OPENCODE_DOMAINS[@]}"; do
         while IFS= read -r ip; do
-            [[ -z "$ip" || -n "${seen[$ip]+x}" ]] && continue
-            seen["$ip"]=1
+            [[ -z "$ip" ]] && continue
+            # дедуп по паре domain+ip: один и тот же IP может обслуживать
+            # несколько доменов, и каждый должен получить IPv4-запись
+            key="$d|$ip"
+            [[ -n "${seen[$key]+x}" ]] && continue
+            seen["$key"]=1
             printf '%-15s %s %s\n' "$ip" "$d" "$HOSTS_MARK" >> "$tmp"
         done < <(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u)
     done
