@@ -3,6 +3,7 @@
 # Проверяет python3+tkinter и показывает понятное сообщение, если их нет.
 
 GUI=/usr/local/lib/ocvpn/ocvpn-gui.py
+export TK_SILENCE_DEPRECATION=1
 
 if [ ! -x /usr/bin/python3 ]; then
     osascript -e 'display dialog "Не найден /usr/bin/python3 — установите Xcode Command Line Tools:  xcode-select --install" buttons {"OK"} default button 1 with icon caution' 2>/dev/null

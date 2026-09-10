@@ -6,7 +6,7 @@ set -euo pipefail
 [[ "$(uname -s)" == "Darwin" ]] || { echo "Сборка native-GUI — только на macOS" >&2; exit 1; }
 command -v swift >/dev/null || { echo "Нужен Swift (Xcode CLT)" >&2; exit 1; }
 
-VER="${1:-1.3.2}"
+VER="${1:-1.3.3}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$REPO/dist"
 

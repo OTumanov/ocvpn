@@ -10,12 +10,13 @@ import socket
 import subprocess
 import sys
 import time
+
+os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 import tkinter as tk
 from tkinter import messagebox
-from tkinter import ttk
 
 APP_NAME = "OCVPN"
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 
 STATE_DIR = os.environ.get(
     "OCVPN_STATE_DIR", os.path.expanduser("~/.local/share/ocvpn")
@@ -29,12 +30,17 @@ ERROR_LOG = os.path.join(
 )
 
 
-def _log_error(exc):
+def _log(msg):
+    """Всегда пишем старт/ошибки в ERROR_LOG — чтобы пустое окно было диагностируемо."""
     try:
         with open(ERROR_LOG, "a") as f:
-            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), exc))
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
     except Exception:
         pass
+
+
+def _log_error(exc):
+    _log(exc)
 
 CANDIDATE_BINS = [
     "/usr/local/bin/ocvpn",
@@ -135,83 +141,97 @@ class App(tk.Tk):
         self.backend = find_backend()
         self.log_path = find_log()
         self.busy = False
-        self._set_theme()
+        _log(
+            "start ver=%s os=%s python=%s tk=%s backend=%s"
+            % (
+                VERSION,
+                sys.platform,
+                sys.version.split()[0],
+                getattr(tk, "TkVersion", "?"),
+                self.backend or "NOT-FOUND",
+            )
+        )
+        self.withdraw()
         self._build()
+        self._reveal()
         self._tick()
 
-    def _set_theme(self):
-        """Форсируем нормальную ttk-тему. На macOS без aqua/clam виджеты ttk
-        могут остаться НЕВИДИМЫМИ (белое окно без кнопок)."""
+    def _reveal(self):
+        """Показать окно и дать Tk отрисоваться (принудительно)."""
         try:
-            s = ttk.Style()
-            for theme in ("aqua", "clam", "default"):
-                try:
-                    s.theme_use(theme)
-                    break
-                except Exception:
-                    continue
+            self.deiconify()
+            self.update_idletasks()
+            self.update()
+            self.lift()
+            self.focus_force()
         except Exception as e:
-            _log_error("ttk theme: %s" % e)
+            _log("reveal: %s" % e)
 
     def _build(self):
-        top = ttk.Frame(self, padding=12)
-        top.pack(fill=tk.X)
+        top = tk.Frame(self, bg="#ffffff")
+        top.pack(fill=tk.X, padx=12, pady=12)
 
-        self.dot = tk.Canvas(top, width=18, height=18, highlightthickness=0)
+        self.dot = tk.Canvas(
+            top, width=18, height=18, highlightthickness=0, bg="#ffffff"
+        )
         self.dot.pack(side=tk.LEFT, padx=(0, 8))
         self.dot_id = self.dot.create_oval(2, 2, 16, 16, fill="#9e9e9e", outline="")
 
         self.status_var = tk.StringVar(value="Проверка…")
-        ttk.Label(top, textvariable=self.status_var, font=("", 13, "bold")).pack(
-            side=tk.LEFT
-        )
+        tk.Label(
+            top, textvariable=self.status_var, font=("", 13, "bold"), bg="#ffffff"
+        ).pack(side=tk.LEFT)
 
-        self.toggle_btn = ttk.Button(top, text="Подключить", command=self.on_toggle)
+        self.toggle_btn = tk.Button(
+            top, text="Подключить", command=self.on_toggle, width=12
+        )
         self.toggle_btn.pack(side=tk.RIGHT)
 
-        mid = ttk.Frame(self, padding=(12, 0, 12, 0))
-        mid.pack(fill=tk.X)
+        mid = tk.Frame(self, bg="#ffffff")
+        mid.pack(fill=tk.X, padx=12)
         self.info_var = tk.StringVar(value="")
-        ttk.Label(mid, textvariable=self.info_var, foreground="#616161").pack(
+        tk.Label(mid, textvariable=self.info_var, fg="#616161", bg="#ffffff").pack(
             side=tk.LEFT
         )
 
-        auto = ttk.Frame(self, padding=(12, 4, 12, 0))
-        auto.pack(fill=tk.X)
+        auto = tk.Frame(self, bg="#ffffff")
+        auto.pack(fill=tk.X, padx=12, pady=(4, 0))
         self.auto_var = tk.BooleanVar(value=False)
         self.auto_changing = False
-        self.auto_box = ttk.Checkbutton(
+        self.auto_box = tk.Checkbutton(
             auto,
             text="Авторотация при лимитах (вотчдог)",
             variable=self.auto_var,
             command=self.on_auto,
+            bg="#ffffff",
+            anchor=tk.W,
         )
         self.auto_box.pack(side=tk.LEFT)
         self.watch_var = tk.StringVar(value="")
-        ttk.Label(auto, textvariable=self.watch_var, foreground="#9e9e9e").pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
+        tk.Label(
+            auto, textvariable=self.watch_var, fg="#9e9e9e", bg="#ffffff"
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
-        log_frame = ttk.LabelFrame(self, text="Логи", padding=6)
+        log_frame = tk.LabelFrame(
+            self, text="Логи", padx=6, pady=6, bg="#ffffff", fg="#424242"
+        )
         log_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
         self.log = tk.Text(log_frame, wrap=tk.WORD, state=tk.DISABLED, height=16)
-        scroll = ttk.Scrollbar(
-            log_frame, orient=tk.VERTICAL, command=self.log.yview
-        )
+        scroll = tk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        bot = ttk.Frame(self, padding=(12, 0, 12, 12))
-        bot.pack(fill=tk.X)
-        ttk.Button(bot, text="Обновить", command=self._tick).pack(side=tk.RIGHT)
-        ttk.Button(bot, text="Новый IP", command=self.on_newip).pack(
+        bot = tk.Frame(self, bg="#ffffff")
+        bot.pack(fill=tk.X, padx=12, pady=(0, 12))
+        tk.Button(bot, text="Обновить", command=self._tick).pack(side=tk.RIGHT)
+        tk.Button(bot, text="Новый IP", command=self.on_newip).pack(
             side=tk.RIGHT, padx=(0, 6)
         )
         self.hint_var = tk.StringVar(
             value="Лог: %s" % self.log_path if self.log_path else ""
         )
-        ttk.Label(bot, textvariable=self.hint_var, foreground="#9e9e9e").pack(
+        tk.Label(bot, textvariable=self.hint_var, fg="#9e9e9e", bg="#ffffff").pack(
             side=tk.LEFT
         )
 
