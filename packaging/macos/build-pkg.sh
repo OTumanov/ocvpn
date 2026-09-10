@@ -7,7 +7,7 @@ set -euo pipefail
 [[ "$(uname -s)" == "Darwin" ]] || { echo "Сборка .pkg — только на macOS" >&2; exit 1; }
 command -v pkgbuild >/dev/null || { echo "Нужен pkgbuild (Xcode Command Line Tools)" >&2; exit 1; }
 
-VER="${1:-1.3.5}"
+VER="${1:-1.3.6}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE="$(mktemp -d /tmp/ocvpn-pkg-XXXXXX)"
 DIST="$REPO/dist"

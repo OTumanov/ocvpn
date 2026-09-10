@@ -16,10 +16,9 @@ import time
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 import tkinter as tk
 from tkinter import messagebox
-from tkinter import simpledialog
 
 APP_NAME = "OCVPN"
-VERSION = "1.3.5"
+VERSION = "1.3.6"
 
 STATE_DIR = os.environ.get(
     "OCVPN_STATE_DIR", os.path.expanduser("~/.local/share/ocvpn")
@@ -177,7 +176,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("%s %s" % (APP_NAME, VERSION))
-        self.geometry("560x505")
+        self.geometry("580x660")
+        self.minsize(520, 500)
         self.resizable(True, True)
         self.backend = find_backend()
         self.log_path = find_log()
@@ -217,43 +217,68 @@ class App(tk.Tk):
             _log("reveal: %s" % e)
 
     def _build(self):
-        top = tk.Frame(self, bg="#ffffff")
-        top.pack(fill=tk.X, padx=12, pady=12)
-
+        # Секция «Состояние»: индикатор + подпись + главная кнопка.
+        state = tk.LabelFrame(
+            self, text="Состояние", padx=8, pady=8, bg="#ffffff", fg="#424242"
+        )
+        state.pack(fill=tk.X, padx=12, pady=(12, 0))
+        head = tk.Frame(state, bg="#ffffff")
+        head.pack(fill=tk.X)
         self.dot = tk.Canvas(
-            top, width=18, height=18, highlightthickness=0, bg="#ffffff"
+            head, width=18, height=18, highlightthickness=0, bg="#ffffff"
         )
         self.dot.pack(side=tk.LEFT, padx=(0, 8))
         self.dot_id = self.dot.create_oval(2, 2, 16, 16, fill="#9e9e9e", outline="")
 
         self.status_var = tk.StringVar(value="Проверка…")
         tk.Label(
-            top, textvariable=self.status_var, font=("", 13, "bold"), bg="#ffffff"
+            head, textvariable=self.status_var, font=("", 13, "bold"), bg="#ffffff"
         ).pack(side=tk.LEFT)
 
         self.toggle_btn = tk.Button(
-            top, text="Подключить", command=self.on_toggle, width=12
+            head, text="Подключить", command=self.on_toggle, width=14
         )
         self.toggle_btn.pack(side=tk.RIGHT)
 
-        mid = tk.Frame(self, bg="#ffffff")
-        mid.pack(fill=tk.X, padx=12)
         self.info_var = tk.StringVar(value="")
-        tk.Label(mid, textvariable=self.info_var, fg="#616161", bg="#ffffff").pack(
-            side=tk.LEFT
-        )
+        tk.Label(
+            state,
+            textvariable=self.info_var,
+            fg="#616161",
+            bg="#ffffff",
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=520,
+        ).pack(fill=tk.X, pady=(4, 0))
 
-        subs = tk.Frame(self, bg="#ffffff")
-        subs.pack(fill=tk.X, padx=12, pady=(2, 0))
+        # Секция «Подписка»: видимое поле ввода + Сохранить (инлайн, без popup).
+        subs = tk.LabelFrame(
+            self, text="Подписка", padx=8, pady=8, bg="#ffffff", fg="#424242"
+        )
+        subs.pack(fill=tk.X, padx=12, pady=(8, 0))
+        row = tk.Frame(subs, bg="#ffffff")
+        row.pack(fill=tk.X)
+        self.subs_entry_var = tk.StringVar(value="")
+        self.subs_entry = tk.Entry(row, textvariable=self.subs_entry_var, width=44)
+        self.subs_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(row, text="Сохранить", command=self.on_subs_save, width=10).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
         self.subs_var = tk.StringVar(value="")
         self.subs_label = tk.Label(
-            subs, textvariable=self.subs_var, fg="#9e9e9e", bg="#ffffff"
+            subs,
+            textvariable=self.subs_var,
+            fg="#9e9e9e",
+            bg="#ffffff",
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=520,
         )
-        self.subs_label.pack(side=tk.LEFT)
-        self._refresh_subs()
+        self.subs_label.pack(fill=tk.X, pady=(4, 0))
+        self._refresh_subs(prefill=True)
 
         auto = tk.Frame(self, bg="#ffffff")
-        auto.pack(fill=tk.X, padx=12, pady=(4, 0))
+        auto.pack(fill=tk.X, padx=12, pady=(8, 0))
         self.auto_var = tk.BooleanVar(value=False)
         self.auto_changing = False
         self.auto_box = tk.Checkbutton(
@@ -274,7 +299,7 @@ class App(tk.Tk):
             self, text="Логи", padx=6, pady=6, bg="#ffffff", fg="#424242"
         )
         log_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
-        self.log = tk.Text(log_frame, wrap=tk.WORD, state=tk.DISABLED, height=16)
+        self.log = tk.Text(log_frame, wrap=tk.WORD, state=tk.DISABLED, height=14)
         scroll = tk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -283,18 +308,21 @@ class App(tk.Tk):
         bot = tk.Frame(self, bg="#ffffff")
         bot.pack(fill=tk.X, padx=12, pady=(0, 12))
         tk.Button(bot, text="Обновить", command=self._tick).pack(side=tk.RIGHT)
-        tk.Button(bot, text="Подписка", command=self.on_subs).pack(
-            side=tk.RIGHT, padx=(0, 6)
-        )
         tk.Button(bot, text="Новый IP", command=self.on_newip).pack(
             side=tk.RIGHT, padx=(0, 6)
         )
         self.hint_var = tk.StringVar(
             value="Лог: %s" % self.log_path if self.log_path else ""
         )
-        tk.Label(bot, textvariable=self.hint_var, fg="#9e9e9e", bg="#ffffff").pack(
-            side=tk.LEFT
-        )
+        tk.Label(
+            bot,
+            textvariable=self.hint_var,
+            fg="#9e9e9e",
+            bg="#ffffff",
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=380,
+        ).pack(side=tk.LEFT)
 
     # --- состояние ---
     def query_state(self):
@@ -392,41 +420,69 @@ class App(tk.Tk):
 
     # --- одна кнопка + авторотация (всё тяжёлое — в фоновых потоках,
     # --- иначе окно виснет на время --daemon/--new-ip) ---
-    def _refresh_subs(self):
+    def _refresh_subs(self, prefill=False):
         ok, text = subs_status()
         self.subs_var.set(text)
         try:
             self.subs_label.configure(fg="#2e7d32" if ok else "#c62828")
         except Exception:
             pass
+        if prefill:
+            try:
+                cur = (
+                    os.environ.get("OCVPN_SUBS_URL", "").strip()
+                    or _read_first_line(USER_SUBS_FILE)
+                    or ""
+                )
+                self.subs_entry_var.set(cur)
+            except Exception:
+                pass
         return ok
 
-    def on_subs(self):
-        """Сохранить URL подписки системно (/etc/ocvpn/subs-url), чтобы backend
-        видел его и под root (GUI запускает команды через osascript с
-        админ-привилегиями — env терминала туда не пробрасывается)."""
-        cur = (
-            os.environ.get("OCVPN_SUBS_URL", "").strip()
-            or _read_first_line(USER_SUBS_FILE)
-            or ""
-        )
-        url = simpledialog.askstring(
-            "Подписка",
-            "URL подписки (vless):\nСохранится системно в /etc/ocvpn/subs-url\n"
-            "(видно и пользователю, и root/daemon).",
-            initialvalue=cur,
-            parent=self,
-        )
+    def on_subs_save(self):
+        """Сохранить URL из поля ввода: сразу в ~/.ocvpn-subs-url (без пароля)
+        + системно в /etc/ocvpn/subs-url (через admin — видно и root/daemon)."""
+        url = self.subs_entry_var.get().strip()
         if not url:
+            self._show_error(
+                "Подписка", "Поле пустое — вставь URL подписки (https://…) и нажми «Сохранить»."
+            )
             return
-        url = url.strip()
-        if not url:
+        if not url.startswith("http"):
+            self._show_error(
+                "Подписка", "Похоже, это не URL подписки: должно начинаться с https://"
+            )
+            return
+        try:
+            with open(USER_SUBS_FILE, "w") as f:
+                f.write(url + "\n")
+            _log("subs: saved %s" % USER_SUBS_FILE)
+        except Exception as e:
+            self._show_error("Подписка", "Не записать %s: %s" % (USER_SUBS_FILE, e))
             return
         cmd = (
             "mkdir -p /etc/ocvpn && printf '%%s' %s > /etc/ocvpn/subs-url"
             " && chmod 600 /etc/ocvpn/subs-url && echo SAVED" % _shq(url)
         )
-        self._do_admin_async(cmd, "подписка", lambda ok, msg: self._refresh_subs())
+        self._do_admin_async(
+            cmd, "подписка", lambda ok, msg: self._finish_subs_save(ok, msg, url)
+        )
+
+    def _finish_subs_save(self, ok, msg, url):
+        if not ok:
+            self._show_error(
+                "Подписка",
+                "В ~/.ocvpn-subs-url сохранено, а системно — нет (%s). "
+                "Кнопки GUI (от root) будут без подписки." % msg,
+            )
+        else:
+            self.info_var.set("Подписка сохранена (файл + системно).")
+            _log("subs: saved /etc/ocvpn/subs-url")
+        try:
+            self.subs_entry_var.set(url)
+        except Exception:
+            pass
+        self._refresh_subs()
 
     def on_toggle(self):
         if self.busy:

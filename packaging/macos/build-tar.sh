@@ -4,7 +4,7 @@
 # На Mac распаковать и: sudo ./install.sh
 set -euo pipefail
 
-VER="${1:-1.3.5}"
+VER="${1:-1.3.6}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE="$(mktemp -d /tmp/ocvpn-mac-XXXXXX)"
 DIST="$REPO/dist"
