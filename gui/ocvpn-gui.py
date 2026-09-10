@@ -9,16 +9,32 @@ import re
 import socket
 import subprocess
 import sys
+import time
 import tkinter as tk
+from tkinter import messagebox
 from tkinter import ttk
 
 APP_NAME = "OCVPN"
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 STATE_DIR = os.environ.get(
     "OCVPN_STATE_DIR", os.path.expanduser("~/.local/share/ocvpn")
 )
 WATCH_PIDFILE = os.path.join(STATE_DIR, "watch.pid")
+
+ERROR_LOG = os.path.join(
+    os.path.expanduser("~/Library/Logs/ocvpn-gui.log")
+    if sys.platform == "darwin"
+    else os.path.expanduser("~/.ocvpn-gui.log")
+)
+
+
+def _log_error(exc):
+    try:
+        with open(ERROR_LOG, "a") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), exc))
+    except Exception:
+        pass
 
 CANDIDATE_BINS = [
     "/usr/local/bin/ocvpn",
@@ -119,8 +135,23 @@ class App(tk.Tk):
         self.backend = find_backend()
         self.log_path = find_log()
         self.busy = False
+        self._set_theme()
         self._build()
         self._tick()
+
+    def _set_theme(self):
+        """Форсируем нормальную ttk-тему. На macOS без aqua/clam виджеты ttk
+        могут остаться НЕВИДИМЫМИ (белое окно без кнопок)."""
+        try:
+            s = ttk.Style()
+            for theme in ("aqua", "clam", "default"):
+                try:
+                    s.theme_use(theme)
+                    break
+                except Exception:
+                    continue
+        except Exception as e:
+            _log_error("ttk theme: %s" % e)
 
     def _build(self):
         top = ttk.Frame(self, padding=12)
@@ -316,4 +347,15 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    try:
+        App().mainloop()
+    except Exception as e:
+        _log_error("startup: %s" % e)
+        try:
+            messagebox.showerror(
+                "OCVPN: ошибка запуска",
+                "Не удалось запустить GUI:\n%s\n\nПодробности: %s" % (e, ERROR_LOG),
+            )
+        except Exception:
+            pass
+        sys.exit(1)
