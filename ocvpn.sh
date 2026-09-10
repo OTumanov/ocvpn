@@ -5,7 +5,7 @@ set -euo pipefail
 # (в частности под sudo/systemd с урезанным PATH). Добавляем, не затирая остальное.
 export PATH="/usr/sbin:/sbin:$PATH"
 
-OCVPN_VERSION="1.3.4"
+OCVPN_VERSION="1.3.5"
 # Linux (iptables REDIRECT) или macOS (pf rdr). Определяем один раз.
 OCVPN_OS="$(uname -s 2>/dev/null || echo Linux)"
 is_macos() { [[ "$OCVPN_OS" == "Darwin" ]]; }

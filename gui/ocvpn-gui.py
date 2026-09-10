@@ -5,6 +5,7 @@
 запрашиваются через штатный диалог macOS (osascript, administrator privileges).
 """
 import os
+import queue
 import re
 import socket
 import subprocess
@@ -18,7 +19,7 @@ from tkinter import messagebox
 from tkinter import simpledialog
 
 APP_NAME = "OCVPN"
-VERSION = "1.3.4"
+VERSION = "1.3.5"
 
 STATE_DIR = os.environ.get(
     "OCVPN_STATE_DIR", os.path.expanduser("~/.local/share/ocvpn")
@@ -70,16 +71,26 @@ def _read_first_line(path):
 
 
 def subs_status():
-    """Какой источник ключей увидит backend. Возвращает (ok, текст)."""
-    if os.environ.get("OCVPN_SUBS_URL", "").strip():
-        return True, "подписка: из окружения"
+    """Какой источник ключей увидит ROOT-backend (osascript). Возвращает (ok, текст).
+    ok=True только если подписку увидит и root: env самого GUI root не видит."""
     if _read_first_line(USER_SUBS_FILE):
         return True, "подписка: ~/.ocvpn-subs-url"
     if os.path.exists(SYS_SUBS_FILE):
         if _read_first_line(SYS_SUBS_FILE):
             return True, "подписка: системная /etc/ocvpn/subs-url"
-        return True, "подписка: системная (скрыта, нет прав на чтение)"
+        return True, "подписка: системная (есть, содержимое скрыто)"
+    if os.environ.get("OCVPN_SUBS_URL", "").strip():
+        return False, "подписка: только env GUI (root её НЕ видит!) — нажми «Подписка»"
     return False, "подписки НЕТ — будет чужой публичный fallback"
+
+
+def _env_prefix():
+    """Если GUI запущен из терминала с OCVPN_SUBS_URL — пробросить её явно
+    в admin-команду (env GUI до root через osascript не доходит)."""
+    url = os.environ.get("OCVPN_SUBS_URL", "").strip()
+    if url:
+        return "OCVPN_SUBS_URL=%s " % _shq(url)
+    return ""
 
 
 def _shq(s):
@@ -184,6 +195,13 @@ class App(tk.Tk):
         )
         self.withdraw()
         self._build()
+        # Очередь результатов фоновых admin-команд. На Tk 8.5 из потока НЕЛЬЗЯ
+        # вызывать self.after() («main thread is not in main loop»), поэтому
+        # поток только кладёт результат в очередь, а главный поток забирает её
+        # в _tick (каждые 3 с) + по событию <<OcvpnAdminDone>> (event_generate
+        # потокобезопасен).
+        self._admin_queue = queue.Queue()
+        self.bind("<<OcvpnAdminDone>>", self._on_admin_event)
         self._reveal()
         self._tick()
 
@@ -297,29 +315,59 @@ class App(tk.Tk):
         return "off", "прокси не отвечает"
 
     def _tick(self):
-        state, detail = self.query_state()
-        colors = {"on": "#2e7d32", "off": "#9e9e9e", "busy": "#ff6600"}
-        labels = {
-            "on": "Подключено",
-            "off": "Отключено",
-            "busy": "Работаю…",
-        }
-        self.dot.itemconfig(self.dot_id, fill=colors[state])
-        self.status_var.set(labels[state])
-        rot = last_rotation(self.log_path)
-        self.info_var.set(detail + (" | " + rot if rot else ""))
-        self.toggle_btn.configure(
-            text="Отключить" if state == "on" else "Подключить",
-            state=tk.DISABLED if state == "busy" else tk.NORMAL,
-        )
-        if not self.auto_changing:
-            wpid = watch_alive()
-            self.auto_var.set(wpid is not None)
-            self.watch_var.set(
-                "вотчдог: pid %d" % wpid if wpid else "вотчдог выключен"
+        try:
+            self._drain_admin_queue()
+            state, detail = self.query_state()
+            colors = {"on": "#2e7d32", "off": "#9e9e9e", "busy": "#ff6600"}
+            labels = {
+                "on": "Подключено",
+                "off": "Отключено",
+                "busy": "Работаю…",
+            }
+            self.dot.itemconfig(self.dot_id, fill=colors[state])
+            self.status_var.set(labels[state])
+            rot = last_rotation(self.log_path)
+            self.info_var.set(detail + (" | " + rot if rot else ""))
+            self.toggle_btn.configure(
+                text="Отключить" if state == "on" else "Подключить",
+                state=tk.DISABLED if state == "busy" else tk.NORMAL,
             )
-        self._load_log()
-        self.after(3000, self._tick)
+            if not self.auto_changing:
+                wpid = watch_alive()
+                self.auto_var.set(wpid is not None)
+                self.watch_var.set(
+                    "вотчдог: pid %d" % wpid if wpid else "вотчдог выключен"
+                )
+            self._load_log()
+        except tk.TclError:
+            # Окно уже закрыто (гонка after-колбэка с destroy) — молча уходим.
+            return
+        try:
+            self.after(3000, self._tick)
+        except tk.TclError:
+            pass
+
+    def _drain_admin_queue(self):
+        """Забрать готовые результаты фоновых команд (только главный поток)."""
+        while True:
+            try:
+                done, ok, msg = self._admin_queue.get_nowait()
+            except queue.Empty:
+                return
+            self.busy = False
+            try:
+                done(ok, msg)
+            except tk.TclError:
+                return
+            except Exception as e:
+                _log("admin done: %s" % e)
+
+    def _on_admin_event(self, _evt=None):
+        try:
+            self._drain_admin_queue()
+            self._tick()
+        except tk.TclError:
+            pass
 
     def _load_log(self):
         path = self.log_path
@@ -395,7 +443,7 @@ class App(tk.Tk):
         self.auto_changing = True
         want = self.auto_var.get()
         if want:
-            cmd = "bash '%s' --daemon --watch" % self.backend
+            cmd = _env_prefix() + "bash '%s' --daemon --watch" % self.backend
         else:
             cmd = "pkill -f 'ocvpn --watch'"
         self._do_admin_async(
@@ -418,9 +466,9 @@ class App(tk.Tk):
             self._show_error("OCVPN", "Не найден backend ocvpn (установите пакет)")
             return
         if action == "start":
-            cmd = "bash '%s' --daemon" % self.backend
+            cmd = _env_prefix() + "bash '%s' --daemon" % self.backend
         elif action == "newip":
-            cmd = "bash '%s' --new-ip" % self.backend
+            cmd = _env_prefix() + "bash '%s' --new-ip" % self.backend
         else:
             cmd = "bash '%s' --cleanup" % self.backend
         self._do_admin_async(cmd, action, lambda ok, msg: self._finish_action(ok, msg))
@@ -440,36 +488,43 @@ class App(tk.Tk):
 
     def _do_admin_async(self, cmd, label, done):
         """Выполнить admin-команду в фоне (GUI не виснет). done(ok, msg)
-        вызывается в главном потоке Tk."""
+        вызывается в главном потоке Tk через очередь (на Tk 8.5 из потока
+        нельзя вызывать даже self.after — только event_generate)."""
         if self.busy:
             return
         self.busy = True
-        self._tick()
+        try:
+            self._tick()
+        except tk.TclError:
+            self.busy = False
+            return
 
         def worker():
             try:
-                _log("action %s: %s" % (label, cmd[:160]))
+                _log("action %s: %s" % (label, cmd[:200]))
                 r = run_admin(cmd)
                 out = ((r.stderr or "") + "\n" + (r.stdout or "")).strip()
                 tail = "\n".join(out.splitlines()[-5:]) if out else ""
                 _log("action %s: rc=%s tail=%r" % (label, r.returncode, tail[-300:]))
                 if r.returncode != 0:
                     msg = tail.splitlines()[0] if tail else "отмена/ошибка"
-                    self.after(0, lambda: self._admin_done(done, False, msg))
+                    self._admin_queue.put((done, False, msg))
                 else:
-                    self.after(0, lambda: self._admin_done(done, True, tail))
+                    self._admin_queue.put((done, True, tail))
             except Exception as e:
                 _log("action %s: EXC %s" % (label, e))
-                self.after(0, lambda: self._admin_done(done, False, str(e)))
+                try:
+                    self._admin_queue.put((done, False, str(e)))
+                except Exception:
+                    pass
+            # Сигнал главному потоку (потокобезопасно). Если не сработает —
+            # результат всё равно подберёт _tick в ближайший цикл (3 с).
+            try:
+                self.event_generate("<<OcvpnAdminDone>>", when="tail")
+            except Exception as e:
+                _log("event_generate: %s" % e)
 
         threading.Thread(target=worker, daemon=True).start()
-
-    def _admin_done(self, done, ok, msg):
-        self.busy = False
-        try:
-            done(ok, msg)
-        finally:
-            self._tick()
 
 
 if __name__ == "__main__":
