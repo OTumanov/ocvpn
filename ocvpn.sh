@@ -5,17 +5,21 @@ set -euo pipefail
 # (в частности под sudo/systemd с урезанным PATH). Добавляем, не затирая остальное.
 export PATH="/usr/sbin:/sbin:$PATH"
 
-OCVPN_VERSION="1.3.3"
+OCVPN_VERSION="1.3.4"
 # Linux (iptables REDIRECT) или macOS (pf rdr). Определяем один раз.
 OCVPN_OS="$(uname -s 2>/dev/null || echo Linux)"
 is_macos() { [[ "$OCVPN_OS" == "Darwin" ]]; }
 
 # === Config ===
-# Приоритет подписки: $OCVPN_SUBS_URL (env) > ~/.ocvpn-subs-url (локальный файл, НЕ в git) > fallback
+# Приоритет подписки: $OCVPN_SUBS_URL (env) > ~/.ocvpn-subs-url (файл пользователя)
+#   > /etc/ocvpn/subs-url (системный — виден root/daemon/GUI через osascript) > fallback
 SUBS_FALLBACK_URL="https://raw.githubusercontent.com/zxcursedzxc0721/vless-subscriptions/refs/heads/main/ru/vless.txt"
 SUBS_URL="${OCVPN_SUBS_URL:-}"
 if [[ -z "$SUBS_URL" && -s "$HOME/.ocvpn-subs-url" ]]; then
     SUBS_URL="$(head -n1 "$HOME/.ocvpn-subs-url" 2>/dev/null | tr -d '[:space:]')"
+fi
+if [[ -z "$SUBS_URL" && -s /etc/ocvpn/subs-url ]]; then
+    SUBS_URL="$(head -n1 /etc/ocvpn/subs-url 2>/dev/null | tr -d '[:space:]')"
 fi
 SUBS_URL="${SUBS_URL:-$SUBS_FALLBACK_URL}"
 SOCKS_PORT=10808
@@ -1258,6 +1262,9 @@ ocvpn $OCVPN_VERSION — прозрачная маршрутизация энд�
                         (URL подписки или готовый txt с vless://; можно в любом
                         месте строки: ocvpn --subs https://… --restart)
 
+  Источник ключей (приоритет): OCVPN_SUBS_URL (env) > ~/.ocvpn-subs-url
+  (файл) > /etc/ocvpn/subs-url (системный — для root/daemon/GUI) > публичный fallback.
+
   При подключении автоматически проверяется доступность моделей opencode
   из текущего региона (geo-block). Если модели недоступны — exit IP
   попадает в карантин на 12 ч, подключение отменяется, пробуется следующий.
@@ -1419,10 +1426,10 @@ main() {
     fi
 
     if [[ "$SUBS_URL" == "$SUBS_FALLBACK_URL" ]]; then
-        warn "Подписка не задана — используется публичный fallback-источник (чужой). Рекомендуется своя: ~/.ocvpn-subs-url"
+        warn "Подписка не задана — используется публичный fallback-источник (чужой). Своя: ~/.ocvpn-subs-url или системная /etc/ocvpn/subs-url"
     fi
     if [[ "${OCVPN_SUBS_FROM_FLAG:-}" == 1 ]]; then
-        log "Подписка из --subs (разово; постоянно: записать URL в ~/.ocvpn-subs-url)"
+        log "Подписка из --subs (разово; постоянно: ~/.ocvpn-subs-url или /etc/ocvpn/subs-url)"
     fi
 
     OCVPN_OWNER=1  # этот процесс владеет xray+маршрутами — EXIT-trap активен

@@ -9,14 +9,16 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 import tkinter as tk
 from tkinter import messagebox
+from tkinter import simpledialog
 
 APP_NAME = "OCVPN"
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 
 STATE_DIR = os.environ.get(
     "OCVPN_STATE_DIR", os.path.expanduser("~/.local/share/ocvpn")
@@ -55,6 +57,34 @@ LOG_FILES = [
     "/var/log/ocvpn.log",
     os.path.expanduser("~/.ocvpn.log"),
 ]
+SYS_SUBS_FILE = "/etc/ocvpn/subs-url"
+USER_SUBS_FILE = os.path.expanduser("~/.ocvpn-subs-url")
+
+
+def _read_first_line(path):
+    try:
+        with open(path) as f:
+            return f.readline().strip()
+    except Exception:
+        return ""
+
+
+def subs_status():
+    """Какой источник ключей увидит backend. Возвращает (ok, текст)."""
+    if os.environ.get("OCVPN_SUBS_URL", "").strip():
+        return True, "подписка: из окружения"
+    if _read_first_line(USER_SUBS_FILE):
+        return True, "подписка: ~/.ocvpn-subs-url"
+    if os.path.exists(SYS_SUBS_FILE):
+        if _read_first_line(SYS_SUBS_FILE):
+            return True, "подписка: системная /etc/ocvpn/subs-url"
+        return True, "подписка: системная (скрыта, нет прав на чтение)"
+    return False, "подписки НЕТ — будет чужой публичный fallback"
+
+
+def _shq(s):
+    """Экранировать строку для sh внутри одинарных кавычек."""
+    return "'" + s.replace("'", "'\\''") + "'"
 
 
 def find_backend():
@@ -136,19 +166,20 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("%s %s" % (APP_NAME, VERSION))
-        self.geometry("560x480")
+        self.geometry("560x505")
         self.resizable(True, True)
         self.backend = find_backend()
         self.log_path = find_log()
         self.busy = False
         _log(
-            "start ver=%s os=%s python=%s tk=%s backend=%s"
+            "start ver=%s os=%s python=%s tk=%s backend=%s subs=%s"
             % (
                 VERSION,
                 sys.platform,
                 sys.version.split()[0],
                 getattr(tk, "TkVersion", "?"),
                 self.backend or "NOT-FOUND",
+                subs_status()[1],
             )
         )
         self.withdraw()
@@ -194,6 +225,15 @@ class App(tk.Tk):
             side=tk.LEFT
         )
 
+        subs = tk.Frame(self, bg="#ffffff")
+        subs.pack(fill=tk.X, padx=12, pady=(2, 0))
+        self.subs_var = tk.StringVar(value="")
+        self.subs_label = tk.Label(
+            subs, textvariable=self.subs_var, fg="#9e9e9e", bg="#ffffff"
+        )
+        self.subs_label.pack(side=tk.LEFT)
+        self._refresh_subs()
+
         auto = tk.Frame(self, bg="#ffffff")
         auto.pack(fill=tk.X, padx=12, pady=(4, 0))
         self.auto_var = tk.BooleanVar(value=False)
@@ -225,6 +265,9 @@ class App(tk.Tk):
         bot = tk.Frame(self, bg="#ffffff")
         bot.pack(fill=tk.X, padx=12, pady=(0, 12))
         tk.Button(bot, text="Обновить", command=self._tick).pack(side=tk.RIGHT)
+        tk.Button(bot, text="Подписка", command=self.on_subs).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
         tk.Button(bot, text="Новый IP", command=self.on_newip).pack(
             side=tk.RIGHT, padx=(0, 6)
         )
@@ -299,7 +342,44 @@ class App(tk.Tk):
         except Exception as e:
             self.hint_var.set("Не читается лог: %s" % e)
 
-    # --- одна кнопка + авторотация ---
+    # --- одна кнопка + авторотация (всё тяжёлое — в фоновых потоках,
+    # --- иначе окно виснет на время --daemon/--new-ip) ---
+    def _refresh_subs(self):
+        ok, text = subs_status()
+        self.subs_var.set(text)
+        try:
+            self.subs_label.configure(fg="#2e7d32" if ok else "#c62828")
+        except Exception:
+            pass
+        return ok
+
+    def on_subs(self):
+        """Сохранить URL подписки системно (/etc/ocvpn/subs-url), чтобы backend
+        видел его и под root (GUI запускает команды через osascript с
+        админ-привилегиями — env терминала туда не пробрасывается)."""
+        cur = (
+            os.environ.get("OCVPN_SUBS_URL", "").strip()
+            or _read_first_line(USER_SUBS_FILE)
+            or ""
+        )
+        url = simpledialog.askstring(
+            "Подписка",
+            "URL подписки (vless):\nСохранится системно в /etc/ocvpn/subs-url\n"
+            "(видно и пользователю, и root/daemon).",
+            initialvalue=cur,
+            parent=self,
+        )
+        if not url:
+            return
+        url = url.strip()
+        if not url:
+            return
+        cmd = (
+            "mkdir -p /etc/ocvpn && printf '%%s' %s > /etc/ocvpn/subs-url"
+            " && chmod 600 /etc/ocvpn/subs-url && echo SAVED" % _shq(url)
+        )
+        self._do_admin_async(cmd, "подписка", lambda ok, msg: self._refresh_subs())
+
     def on_toggle(self):
         if self.busy:
             return
@@ -314,55 +394,81 @@ class App(tk.Tk):
             return
         self.auto_changing = True
         want = self.auto_var.get()
-        self.after(100, lambda: self._run_auto(want))
+        if want:
+            cmd = "bash '%s' --daemon --watch" % self.backend
+        else:
+            cmd = "pkill -f 'ocvpn --watch'"
+        self._do_admin_async(
+            cmd, "вотчдог", lambda ok, msg: self._finish_auto(ok, msg)
+        )
+
+    def _finish_auto(self, ok, msg):
+        self.auto_changing = False
+        if not ok:
+            self._show_error("Вотчдог", msg)
+        self._tick()
 
     def on_newip(self):
         if self.busy or not self.backend:
             return
-        self.busy = True
-        self._tick()
-        self.after(100, lambda: self._run_action("newip"))
-
-    def _run_auto(self, want):
-        try:
-            if want:
-                cmd = "bash '%s' --daemon --watch" % self.backend
-            else:
-                cmd = "pkill -f 'ocvpn --watch'"
-            r = run_admin(cmd)
-            if r.returncode != 0:
-                err = (r.stderr or r.stdout or "отмена/ошибка").strip().splitlines()
-                self.info_var.set("Ошибка: %s" % (err[0] if err else "?"))
-        except Exception as e:
-            self.info_var.set("Ошибка: %s" % e)
-        finally:
-            self.auto_changing = False
-            self._tick()
+        self._do("newip")
 
     def _do(self, action):
         if not self.backend:
-            self.info_var.set("Не найден backend ocvpn (установите пакет)")
+            self._show_error("OCVPN", "Не найден backend ocvpn (установите пакет)")
+            return
+        if action == "start":
+            cmd = "bash '%s' --daemon" % self.backend
+        elif action == "newip":
+            cmd = "bash '%s' --new-ip" % self.backend
+        else:
+            cmd = "bash '%s' --cleanup" % self.backend
+        self._do_admin_async(cmd, action, lambda ok, msg: self._finish_action(ok, msg))
+
+    def _finish_action(self, ok, msg):
+        if not ok:
+            self._show_error("OCVPN", msg)
+        self._tick()
+
+    def _show_error(self, title, msg):
+        _log("%s: %s" % (title, msg))
+        self.info_var.set("Ошибка: %s" % msg)
+        try:
+            messagebox.showerror(title, "%s\n\nПодробности: %s" % (msg, ERROR_LOG))
+        except Exception:
+            pass
+
+    def _do_admin_async(self, cmd, label, done):
+        """Выполнить admin-команду в фоне (GUI не виснет). done(ok, msg)
+        вызывается в главном потоке Tk."""
+        if self.busy:
             return
         self.busy = True
         self._tick()
-        self.after(100, lambda: self._run_action(action))
 
-    def _run_action(self, action):
+        def worker():
+            try:
+                _log("action %s: %s" % (label, cmd[:160]))
+                r = run_admin(cmd)
+                out = ((r.stderr or "") + "\n" + (r.stdout or "")).strip()
+                tail = "\n".join(out.splitlines()[-5:]) if out else ""
+                _log("action %s: rc=%s tail=%r" % (label, r.returncode, tail[-300:]))
+                if r.returncode != 0:
+                    msg = tail.splitlines()[0] if tail else "отмена/ошибка"
+                    self.after(0, lambda: self._admin_done(done, False, msg))
+                else:
+                    self.after(0, lambda: self._admin_done(done, True, tail))
+            except Exception as e:
+                _log("action %s: EXC %s" % (label, e))
+                self.after(0, lambda: self._admin_done(done, False, str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _admin_done(self, done, ok, msg):
+        self.busy = False
         try:
-            if action == "start":
-                cmd = "bash '%s' --daemon" % self.backend
-            elif action == "newip":
-                cmd = "bash '%s' --new-ip" % self.backend
-            else:
-                cmd = "bash '%s' --cleanup" % self.backend
-            r = run_admin(cmd)
-            if r.returncode != 0:
-                err = (r.stderr or r.stdout or "отмена/ошибка").strip().splitlines()
-                self.info_var.set("Ошибка: %s" % (err[0] if err else "?"))
-        except Exception as e:
-            self.info_var.set("Ошибка: %s" % e)
+            done(ok, msg)
         finally:
-            self.busy = False
             self._tick()
 
 
