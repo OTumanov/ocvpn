@@ -8,7 +8,16 @@ set -euo pipefail
 [[ "$(id -u)" == "0" ]] || { echo "Запустите через sudo: sudo ./install.sh" >&2; exit 1; }
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$SRC/../.." && pwd)"
+
+# Корень: либо рядом (распакованный архив), либо $SRC/../.. (репозиторий)
+REPO=""
+for cand in "$SRC" "$SRC/.." "$SRC/../.."; do
+    if [[ -f "$cand/ocvpn.sh" && -d "$cand/gui" ]]; then
+        REPO="$(cd "$cand" && pwd)"
+        break
+    fi
+done
+[[ -n "$REPO" ]] || { echo "Не найден ocvpn.sh рядом с install.sh" >&2; exit 1; }
 
 install -m 0755 "$REPO/ocvpn.sh" /usr/local/bin/ocvpn
 mkdir -p /usr/local/lib/ocvpn

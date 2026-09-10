@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import ttk
 
 APP_NAME = "OCVPN"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 STATE_DIR = os.environ.get(
     "OCVPN_STATE_DIR", os.path.expanduser("~/.local/share/ocvpn")

@@ -2,6 +2,7 @@
 
 Прозрачная маршрутизация эндпоинтов [opencode](https://opencode.ai) и подключённых провайдеров моделей через VLESS-VPN. Весь остальной трафик хоста не затрагивается.
 
+**v1.3.1:** фикс macOS-инсталлятора (поиск `ocvpn.sh` рядом с `install.sh` — заработал из распакованного архива).
 **v1.3.0:** запуск в фоне (`--daemon`, терминал свободен), вотчдог лимитов — сам ловит
 IP-лимиты opencode/zen/go в логе opencode и переключается на ключ с **другим**
 exit IP, исчерпанные IP уходят в карантин. При подключении **проверяется
@@ -197,8 +198,8 @@ bash ocvpn-tests.sh    # ожидается PASS=59 FAIL=0
 ## Установка пакетами
 
 ```bash
-make deb        # dist/ocvpn-1.3.0-all.deb  (Debian/Ubuntu, systemd-юнит ocvpn.service)
-make macos-tar  # dist/ocvpn-1.3.0-macos.tar.gz (macOS: ocvpn + OCVPN.app + LaunchDaemon)
+make deb        # dist/ocvpn-1.3.1-all.deb  (Debian/Ubuntu, systemd-юнит ocvpn.service)
+make macos-tar  # dist/ocvpn-1.3.1-macos.tar.gz (macOS: ocvpn + OCVPN.app + LaunchDaemon)
 ```
 
 Debian: `sudo dpkg -i dist/ocvpn-*.deb` (сервис включается, но не стартует сам —

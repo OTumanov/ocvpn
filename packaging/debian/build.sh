@@ -3,7 +3,7 @@
 # Не устанавливает и ничего не запускает — только собирает dist/ocvpn-*.deb
 set -euo pipefail
 
-VER="${1:-1.3.0}"
+VER="${1:-1.3.1}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE="$(mktemp -d /tmp/ocvpn-deb-XXXXXX)"
 DIST="$REPO/dist"
