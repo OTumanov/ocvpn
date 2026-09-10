@@ -327,7 +327,7 @@ vless_to_xray() {
     "realitySettings": {
         "serverName": "$sni",
         "fingerprint": "${fp:-chrome}",
-        "password": "$pbk",
+        "publicKey": "$pbk",
         "shortId": "$sid"
     }$(xhttp_stream_settings "$type" "$path" "$sni" "$mode")
     $(grpc_stream_settings "$type" "$serviceName")
@@ -501,9 +501,12 @@ download_subscription() {
 
 # Поддерживаем ли мы тип ключа (только vless-типы, что умеет vless_to_xray)
 is_supported_key() {
-    local url="$1"
-    case "$url" in
-        vless://*tcp*|vless://*type=raw*|vless://*ws*|vless://*grpc*|vless://*xhttp*) ;;
+    local url="$1" t
+    # тип берём строго из параметра type=, а не из подстроки во всём URL
+    t=$(printf '%s' "$url" | sed -n 's/.*[?&]type=\([^&#]*\).*/\1/p')
+    [[ -z "$t" ]] && t="tcp"
+    case "$t" in
+        tcp|raw|ws|grpc|xhttp) ;;
         *) return 1 ;;
     esac
     # xhttp c sing-box extra (packet-up/upstream) пока не поддерживаем в xray
@@ -523,9 +526,13 @@ main() {
     fi
 
     # Check dependencies
-    for cmd in curl python3 unzip; do
-        command -v "$cmd" &>/dev/null || { err "Нужен $cmd"; exit 1; }
+    for cmd in curl python3 unzip iptables; do
+        command -v "$cmd" &>/dev/null || { err "Нужен $cmd (apt install iptables)"; exit 1; }
     done
+
+    if [[ "$SUBS_URL" == "$SUBS_FALLBACK_URL" ]]; then
+        warn "Подписка не задана — используется публичный fallback-источник (чужой). Рекомендуется своя: ~/.ocvpn-subs-url"
+    fi
 
     mkdir -p "$TMPDIR_BASE"
     TMPDIR=$(mktemp -d "$TMPDIR_BASE/XXXXXX")
@@ -613,8 +620,8 @@ main() {
             log "Готово. Только трафик к эндпоинтам opencode идёт через VPN (рабочий ключ: $label, $host:$cport)."
             log "Сайты на nginx и весь остальной хост — не тронуты."
             log "Запускай opencode сам. Для смены ключа/очистки: $0 --cleanup"
-            # держим xray в foreground
-            KEEP_ROUTES=1
+            # держим xray в foreground; на выходе cleanup снимет маршруты,
+            # т.к. xray уже будет мёртв и REDIRECT-правила стали бы чёрной дырой
             wait "$XRAY_PID" 2>/dev/null || true
             exit 0
         else

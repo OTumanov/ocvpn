@@ -2,7 +2,7 @@
 # Тесты для opencode-vpn.sh (безопасно: iptables/hosts/xray замоканы)
 set -uo pipefail
 
-SCRIPT="/root/opencode-vpn.sh"
+SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ocvpn.sh"
 PASS=0
 FAIL=0
 TESTS_DIR=$(mktemp -d /tmp/ovpn-tests-XXXXXX)
