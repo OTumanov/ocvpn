@@ -1,4 +1,4 @@
-VERSION ?= 1.3.6
+VERSION ?= 1.4.0
 DIST = dist
 
 .PHONY: all test deb macos-tar clean

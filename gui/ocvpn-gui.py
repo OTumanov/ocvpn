@@ -18,7 +18,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 APP_NAME = "OCVPN"
-VERSION = "1.3.6"
+VERSION = "1.4.0"
 
 STATE_DIR = os.environ.get(
     "OCVPN_STATE_DIR", os.path.expanduser("~/.local/share/ocvpn")
