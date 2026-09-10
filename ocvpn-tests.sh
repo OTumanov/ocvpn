@@ -407,6 +407,145 @@ else
 fi
 rm -rf "$TRAPROOT"
 
+# ==== 6. CLI restart/subs ====
+echo ""
+echo "[6] Перезапуск и --subs"
+
+if bash "$SCRIPT" --help 2>/dev/null | grep -q -- "--restart" \
+    && bash "$SCRIPT" --help 2>/dev/null | grep -q -- "--new-ip" \
+    && bash "$SCRIPT" --help 2>/dev/null | grep -q -- "--subs"; then
+    PASS=$((PASS+1)); echo "  ▸ help ключи: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ help ключи: FAIL"
+fi
+
+# --new-ip без активного держателя: чистая ошибка, без побочек
+# ВАЖНО: OCVPN_STATE_DIR передаётся через env, чтобы дочерний процесс
+# НЕ видел реальный ~/.local/share/ocvpn/active.env
+rc_newip=0
+OCVPN_STATE_DIR="$TESTS_DIR/emptystate" bash "$SCRIPT" --new-ip </dev/null >/dev/null 2>&1 || rc_newip=$?
+if [[ $rc_newip -ne 0 ]]; then
+    PASS=$((PASS+1)); echo "  ▸ new-ip без держателя: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ new-ip без держателя: FAIL"
+fi
+
+# parse_subs_flag: файл / URL / мусор / пусто
+PF_LOAD="$TESTS_DIR/subs-func.sh"
+sed '/# === Main ===/,$d' "$SCRIPT" > "$PF_LOAD"
+printf 'trap - EXIT\n' >> "$PF_LOAD"
+printf 'vless://u1@1.2.3.4:443?security=none&type=tcp#One\nvless://u2@5.6.7.8:443?security=none&type=tcp#Two\n' > "$TESTS_DIR/keys.txt"
+printf 'not a key\njust text\n' > "$TESTS_DIR/nokeys.txt"
+subs_case() { # $1=имя $2=ожидаемый rc $3..=аргументы
+    local name="$1" want="$2"; shift 2
+    local rc=0
+    ( set +e; source "$PF_LOAD" >/dev/null 2>&1; set +e; parse_subs_flag "$@" 2>/dev/null ) || rc=$?
+    if [[ $rc == "$want" ]]; then
+        PASS=$((PASS+1)); echo "  ▸ subs $name: OK"
+    else
+        FAIL=$((FAIL+1)); echo "  ▸ subs $name: FAIL (want rc=$want got $rc)"
+    fi
+}
+subs_case "файл" 0 --subs "$TESTS_DIR/keys.txt"
+subs_case "url" 0 --subs https://example.com/sub.txt
+subs_case "флаг-после-команды" 0 --restart --subs https://example.com/sub.txt
+subs_case "мусор" 2 --subs 'не файл и не ссылка'
+subs_case "пусто" 2 --subs
+
+# download_subscription из файла
+dl_case() { # $1=имя $2=want_rc $3=файл
+    local name="$1" want="$2" f="$3" rc=0
+    ( source "$PF_LOAD" >/dev/null 2>&1; OCVPN_SUBS_FILE="$f" download_subscription "$TESTS_DIR/dl-out.txt" >/dev/null 2>&1 ) || rc=$?
+    if [[ $rc == "$want" ]] && { [[ "$want" != 0 ]] || grep -q '^vless://' "$TESTS_DIR/dl-out.txt"; }; then
+        PASS=$((PASS+1)); echo "  ▸ download $name: OK"
+    else
+        FAIL=$((FAIL+1)); echo "  ▸ download $name: FAIL (rc=$rc)"
+    fi
+}
+dl_case "файл-с-ключами" 0 "$TESTS_DIR/keys.txt"
+dl_case "нет-файла" 1 "$TESTS_DIR/nope.txt"
+dl_case "без-vless" 1 "$TESTS_DIR/nokeys.txt"
+
+# ==== 7. Geo-check (доступность моделей) ====
+echo ""
+echo "[7] Geo-check: доступность моделей"
+
+# Функция check_model_available определена и вызываема
+( source "$FUNC_LOAD" >/dev/null 2>&1; type check_model_available &>/dev/null )
+if [[ $? -eq 0 ]]; then
+    PASS=$((PASS+1)); echo "  ▸ check_model_available существует: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ check_model_available существует: FAIL"
+fi
+
+# GEO_BLOCK_PATTERNS определён и содержит ключевые паттерны
+( source "$FUNC_LOAD" >/dev/null 2>&1; [[ ${#GEO_BLOCK_PATTERNS[@]} -ge 4 ]] )
+if [[ $? -eq 0 ]]; then
+    PASS=$((PASS+1)); echo "  ▸ GEO_BLOCK_PATTERNS >= 4: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ GEO_BLOCK_PATTERNS >= 4: FAIL"
+fi
+
+# FREE_MODELS определён
+( source "$FUNC_LOAD" >/dev/null 2>&1; [[ ${#FREE_MODELS[@]} -ge 3 ]] )
+if [[ $? -eq 0 ]]; then
+    PASS=$((PASS+1)); echo "  ▸ FREE_MODELS >= 3: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ FREE_MODELS >= 3: FAIL"
+fi
+
+# quarantine_add с geo-block: записывается, quarantine_blocked возвращает 0
+GEO_QDIR="$TESTS_DIR/geo"
+mkdir -p "$GEO_QDIR"
+( source "$FUNC_LOAD" >/dev/null 2>&1
+  OCVPN_STATE_DIR="$GEO_QDIR"
+  QUARANTINE_FILE="$GEO_QDIR/quarantine.tsv"
+  touch "$QUARANTINE_FILE"
+  quarantine_add "fr1.example.com" "443" "5.6.7.8" "geo-block: модели не доступны из региона" 12
+  if quarantine_blocked "fr1.example.com" "443" ""; then
+      echo "GEO_QUARANTINE_OK"
+  else
+      echo "GEO_QUARANTINE_FAIL"
+  fi
+) 2>/dev/null | grep -q GEO_QUARANTINE_OK
+if [[ $? -eq 0 ]]; then
+    PASS=$((PASS+1)); echo "  ▸ geo-block quarantine: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ geo-block quarantine: FAIL"
+fi
+
+# check_model_available с пустым auth.json: возвращает 0 (skip проверки)
+GEO_EMPTY="$TESTS_DIR/empty-auth"
+mkdir -p "$GEO_EMPTY/.local/share/ocvpn" "$GEO_EMPTY/.local/share/opencode"
+echo '{}' > "$GEO_EMPTY/.local/share/opencode/auth.json"
+CURL_STUB="$TESTS_DIR/curl-stub"
+cat > "$CURL_STUB" <<'STUBEOF'
+#!/bin/bash
+echo "200"
+STUBEOF
+chmod +x "$CURL_STUB"
+( source "$FUNC_LOAD" >/dev/null 2>&1
+  HOME="$GEO_EMPTY"
+  OCVPN_STATE_DIR="$GEO_EMPTY/.local/share/ocvpn"
+  QUARANTINE_FILE="$GEO_EMPTY/.local/share/ocvpn/quarantine.tsv"
+  touch "$QUARANTINE_FILE"
+  PATH="$CURL_STUB:$PATH"
+  check_model_available && echo "EMPTY_AUTH_OK" || echo "EMPTY_AUTH_FAIL"
+) 2>/dev/null | grep -q EMPTY_AUTH_OK
+if [[ $? -eq 0 ]]; then
+    PASS=$((PASS+1)); echo "  ▸ пустой auth.json (skip): OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ пустой auth.json (skip): FAIL"
+fi
+
+# help содержит упоминание geo-block
+bash "$SCRIPT" --help 2>/dev/null | grep -qi "geo-block\|geo.block\|доступность моделей\|регион"
+if [[ $? -eq 0 ]]; then
+    PASS=$((PASS+1)); echo "  ▸ help geo-check docs: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ help geo-check docs: FAIL"
+fi
+
 echo ""
 echo "Итог: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

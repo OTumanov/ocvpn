@@ -5,7 +5,7 @@ set -euo pipefail
 # (в частности под sudo/systemd с урезанным PATH). Добавляем, не затирая остальное.
 export PATH="/usr/sbin:/sbin:$PATH"
 
-OCVPN_VERSION="1.2.0"
+OCVPN_VERSION="1.3.0"
 # Linux (iptables REDIRECT) или macOS (pf rdr). Определяем один раз.
 OCVPN_OS="$(uname -s 2>/dev/null || echo Linux)"
 is_macos() { [[ "$OCVPN_OS" == "Darwin" ]]; }
@@ -632,6 +632,15 @@ select_candidates() {
 # Многие провайдеры (V2Board/Marzban) отдают подписку в base64. Пишем в $1 декодированный текст.
 download_subscription() {
     local out="$1"
+    # Разовый источник через --subs: готовый файл с ключами (без скачивания)
+    if [[ -n "${OCVPN_SUBS_FILE:-}" ]]; then
+        [[ -f "$OCVPN_SUBS_FILE" ]] || { err "Файл ключей не найден: $OCVPN_SUBS_FILE"; return 1; }
+        grep -qE '^vless://' "$OCVPN_SUBS_FILE" \
+            || { err "В файле нет vless:// ключей: $OCVPN_SUBS_FILE"; return 1; }
+        cp "$OCVPN_SUBS_FILE" "$out"
+        log "Ключи из файла: $OCVPN_SUBS_FILE (разово, не сохраняется)"
+        return 0
+    fi
     local raw="$TMPDIR/sub_raw.$$"
     curl -fsSL --connect-timeout 10 "$SUBS_URL" -o "$raw" 2>/dev/null || { err "Не удалось скачать подписку"; return 1; }
 
@@ -777,6 +786,94 @@ quarantine_count() {
     grep -c . "$QUARANTINE_FILE" 2>/dev/null || echo 0
 }
 
+# === Проверка доступности моделей через opencode API (geo-block детект) ===
+# После HTTP 204 (VPN жив) делаем минимальный запрос к opencode API
+# с конкретными free-моделями, которые реально блокируются по GeoIP.
+# Если хотя бы одна free-модель доступна — регион ОК.
+# Если ВСЕ free-модели вернули geo-block — exit IP нерабочий.
+# Возвращает 0 = доступно (хотя бы одна free OK), 1 = все заблокированы.
+FREE_MODELS=(
+    "opencode/muse-spark-1.3-contributor-free"
+    "opencode/muse-spark-1.2-contributor-free"
+    "opencode/ling-3.0-flash-fin-free"
+    "opencode/nemotron-3-ultra-free"
+    "opencode/mimo-v2.5-free"
+)
+GEO_BLOCK_PATTERNS=(
+    "not available in your country"
+    "not available in your region"
+    "not supported in your country"
+    "not supported in your region"
+    "geo restricted"
+    "unavailable in your area"
+    "forbidden.*country"
+    "blocked.*region"
+)
+check_model_available() {
+    local api_key=""
+    local auth_file="$HOME/.local/share/opencode/auth.json"
+    if [[ -f "$auth_file" ]]; then
+        api_key=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$auth_file'))
+    print(d.get('opencode', {}).get('key', ''))
+except: pass
+" 2>/dev/null) || true
+    fi
+    if [[ -z "$api_key" ]]; then
+        warn "  auth.json не найден или нет ключа opencode — пропускаю проверку моделей"
+        return 0
+    fi
+    local ok_count=0 blocked_count=0 total=${#FREE_MODELS[@]}
+    local model
+    for model in "${FREE_MODELS[@]}"; do
+        local payload
+        payload=$(printf '{"model":"%s","messages":[{"role":"user","content":"ping"}],"max_tokens":1}' "$model")
+        local http_code body
+        body=$(curl -s -w '\n%{http_code}' \
+            --proxy "socks5h://127.0.0.1:$SOCKS_PORT" \
+            --connect-timeout 8 --max-time 12 \
+            -X POST "https://api.opencode.ai/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $api_key" \
+            -d "$payload" 2>/dev/null) || true
+        http_code=$(printf '%s' "$body" | tail -n1)
+        body=$(printf '%s' "$body" | sed '$d')
+        local short_model="${model#opencode/}"
+        # 200/201 = OK, 429 = rate limit (не geo, считаем OK)
+        if [[ "$http_code" == "200" || "$http_code" == "201" || "$http_code" == "429" ]]; then
+            ok_count=$((ok_count+1))
+            continue
+        fi
+        # Проверяем body на geo-паттерны
+        local lower_body is_geo=0
+        lower_body=$(printf '%s' "$body" | tr '[:upper:]' '[:lower:]')
+        local pat
+        for pat in "${GEO_BLOCK_PATTERNS[@]}"; do
+            if printf '%s' "$lower_body" | grep -qiE -- "$pat" 2>/dev/null; then
+                is_geo=1; break
+            fi
+        done
+        # HTTP 403/451 без явного geo-паттерна — тоже geo-block
+        if [[ "$is_geo" -eq 0 && ("$http_code" == "403" || "$http_code" == "451") ]]; then
+            is_geo=1
+        fi
+        if [[ "$is_geo" -eq 1 ]]; then
+            blocked_count=$((blocked_count+1))
+            warn "  $short_model: GEO-BLOCK (HTTP $http_code)"
+        else
+            # 500/502/timeout — проблемы сервера, не geo
+            ok_count=$((ok_count+1))
+        fi
+    done
+    log "  Модели: $ok_count/$total доступны, $blocked_count/$total заблокированы"
+    if [[ "$ok_count" -eq 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
 # Текущий выходной IP через поднятый SOCKS (пусто — прокси недоступен)
 current_exit_ip() {
     local ip=""
@@ -889,6 +986,14 @@ pick_working_key() {
                 wait "$XRAY_PID" 2>/dev/null || true
                 continue
             fi
+            # Проверяем доступность моделей opencode из текущего региона
+            if ! check_model_available; then
+                warn "  exit IP $exit_ip: модели заблокированы по региону — карантин 12 ч"
+                quarantine_add "$host" "$cport" "$exit_ip" "geo-block: модели не доступны из региона" 12
+                kill "$XRAY_PID" 2>/dev/null || true
+                wait "$XRAY_PID" 2>/dev/null || true
+                continue
+            fi
             ACTIVE_LABEL="$label"
             ACTIVE_HOST="$host"
             ACTIVE_PORT="$cport"
@@ -975,6 +1080,70 @@ supervise() {
     done
 }
 
+# --restart: прибить держателя (если есть) и поднять свежий ключ В ФОНЕ.
+# В терминал — пара строк, весь подбор — в $OCVPN_LOG.
+do_restart() {
+    no_cleanup
+    local old_ip="" old_started=""
+    if [[ -f "$ACTIVE_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$ACTIVE_FILE" 2>/dev/null || true
+        old_ip="${ACTIVE_EXIT_IP:-}"; old_started="${STARTED:-}"
+        if [[ -n "${HOLDER_PID:-}" ]] && kill -0 "$HOLDER_PID" 2>/dev/null; then
+            log "Глушу держателя (pid $HOLDER_PID, exit IP ${old_ip:-?})…"
+            kill "$HOLDER_PID" 2>/dev/null || true
+            local i
+            for i in $(seq 1 15); do
+                kill -0 "$HOLDER_PID" 2>/dev/null || break
+                sleep 1
+            done
+            if kill -0 "$HOLDER_PID" 2>/dev/null; then
+                kill -9 "$HOLDER_PID" 2>/dev/null || true
+                sleep 1
+            fi
+            log "Держатель остановлен (маршруты сняты его trap'ом)."
+        fi
+    fi
+    # Ждём освобождения SOCKS-порта — признак, что старый xray точно умер
+    local i
+    for i in $(seq 1 15); do
+        (exec 3<>/dev/tcp/127.0.0.1/$SOCKS_PORT) 2>/dev/null || break
+        exec 3>&- 2>/dev/null || true
+        sleep 1
+    done
+    mkdir -p "$(dirname "$OCVPN_LOG")"
+    log "Подбираю новый ключ в фоне (лог $OCVPN_LOG)…"
+    setsid nohup "$0" </dev/null >>"$OCVPN_LOG" 2>&1 &
+    local bgpid=$!
+    # Ждём свежий active.env (подбор: подписка+пинг+тесты, обычно < 90 сек)
+    local j
+    for j in $(seq 1 90); do
+        sleep 2
+        kill -0 "$bgpid" 2>/dev/null || break
+        if [[ -f "$ACTIVE_FILE" ]]; then
+            local ns nip
+            ns="$(grep -E '^STARTED=' "$ACTIVE_FILE" 2>/dev/null | cut -d= -f2)"
+            nip="$(grep -E '^ACTIVE_EXIT_IP=' "$ACTIVE_FILE" 2>/dev/null | cut -d= -f2)"
+            if [[ -n "$ns" && "$ns" != "$old_started" && -n "$nip" ]]; then
+                if [[ -n "$old_ip" && "$nip" == "$old_ip" ]]; then
+                    log "Выпал тот же IP ($nip) — добираю другой…"
+                    bash "$0" --rotate "restart: тот же IP" >/dev/null 2>&1 || true
+                    sleep 5
+                    nip="$(grep -E '^ACTIVE_EXIT_IP=' "$ACTIVE_FILE" 2>/dev/null | cut -d= -f2)"
+                fi
+                log "Готово в фоне: exit IP ${nip:-?} (было ${old_ip:-none}). Детали: $OCVPN_LOG"
+                return 0
+            fi
+        fi
+    done
+    if kill -0 "$bgpid" 2>/dev/null; then
+        log "Подбор ещё идёт в фоне (pid $bgpid) — смотри: tail -f $OCVPN_LOG"
+        return 0
+    fi
+    err "Фоновый подбор упал — смотри хвост: tail -n 30 $OCVPN_LOG"
+    return 1
+}
+
 # --rotate [reason]: отдельный процесс — просит держателя переключиться
 do_rotate() {
     no_cleanup
@@ -1007,6 +1176,10 @@ do_rotate() {
 # --watch: следит за логом opencode, ловит IP-лимиты, дёргает --rotate
 do_watch() {
     no_cleanup
+    if [[ -f "$WATCH_PIDFILE" ]] && kill -0 "$(cat "$WATCH_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        err "Вотчдог уже запущен (pid $(cat "$WATCH_PIDFILE")). Дубль не стартую."
+        exit 1
+    fi
     [[ -f "$OPENCODE_LOG" ]] || { err "Лог opencode не найден: $OPENCODE_LOG"; exit 1; }
     mkdir -p "$OCVPN_STATE_DIR"
     echo $$ > "$WATCH_PIDFILE"
@@ -1042,6 +1215,31 @@ do_watch() {
     done
 }
 
+# Разбор --subs <http(s)-url|путь-к-файлу>: файл — готовый txt с vless://
+# ключами, URL — подписка для скачивания. Действует разово (не сохраняется).
+parse_subs_flag() {
+    local next=0 a
+    for a in "$@"; do
+        if (( next )); then
+            next=0
+            if [[ -f "$a" ]]; then
+                export OCVPN_SUBS_FILE="$a"
+            elif [[ "$a" =~ ^https?:// ]]; then
+                export OCVPN_SUBS_URL="$a" OCVPN_SUBS_FROM_FLAG=1
+            else
+                err "--subs: не файл и не http(s)-URL: $a"
+                exit 2
+            fi
+        elif [[ "$a" == "--subs" ]]; then
+            next=1
+        fi
+    done
+    if (( next )); then
+        err "--subs: нет значения (нужен URL или путь к файлу)"
+        exit 2
+    fi
+}
+
 # === Main ===
 print_help() {
     cat <<HELP_EOF
@@ -1052,7 +1250,18 @@ ocvpn $OCVPN_VERSION — прозрачная маршрутизация энд�
   ocvpn --daemon         запустить в фоне (лог: $OCVPN_LOG), терминал свободен
   ocvpn --daemon --watch фон + вотчдог лимитов (сам ловит лимиты и ротирует IP)
   ocvpn --watch          вотчдог лимитов в foreground (ловит лимиты в логе opencode)
-  ocvpn --rotate [why]   разово переключиться на ключ с ДРУГИМ exit IP
+  ocvpn --new-ip         сменить IP сейчас (то же, что --rotate): другой exit IP
+  ocvpn --restart        перезапустить в фоне: новый ключ + (обычно) новый IP
+  ocvpn --rotate [why]   то же, что --new-ip (алиас)
+
+  --subs URL|ФАЙЛ       разовый источник ключей для запуска/рестарта
+                        (URL подписки или готовый txt с vless://; можно в любом
+                        месте строки: ocvpn --subs https://… --restart)
+
+  При подключении автоматически проверяется доступность моделей opencode
+  из текущего региона (geo-block). Если модели недоступны — exit IP
+  попадает в карантин на 12 ч, подключение отменяется, пробуется следующий.
+
   ocvpn --cleanup        снять маршрутизацию, убрать IPv4-записи из /etc/hosts
   ocvpn --status         показать состояние (xray, порты, маршруты, exit IP, карантин)
   ocvpn --version        версия
@@ -1143,6 +1352,12 @@ exit_ip_fast() {
 }
 
 main() {
+    # --subs <url|файл> в любом месте командной строки: разовый источник ключей
+    # для этого запуска/рестарта (фоновым потомкам достаётся через export).
+    parse_subs_flag "$@"
+    if [[ -n "${OCVPN_SUBS_URL:-}" ]]; then
+        SUBS_URL="$OCVPN_SUBS_URL"
+    fi
     case "${1:-}" in
         --help|-h)
             no_cleanup
@@ -1159,8 +1374,12 @@ main() {
             do_status
             exit $?
             ;;
-        --rotate)
+        --rotate|--new-ip)
             do_rotate "${2:-ручная ротация}"
+            exit $?
+            ;;
+        --restart)
+            do_restart
             exit $?
             ;;
         --watch)
@@ -1201,6 +1420,9 @@ main() {
 
     if [[ "$SUBS_URL" == "$SUBS_FALLBACK_URL" ]]; then
         warn "Подписка не задана — используется публичный fallback-источник (чужой). Рекомендуется своя: ~/.ocvpn-subs-url"
+    fi
+    if [[ "${OCVPN_SUBS_FROM_FLAG:-}" == 1 ]]; then
+        log "Подписка из --subs (разово; постоянно: записать URL в ~/.ocvpn-subs-url)"
     fi
 
     OCVPN_OWNER=1  # этот процесс владеет xray+маршрутами — EXIT-trap активен

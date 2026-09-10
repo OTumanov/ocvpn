@@ -2,9 +2,13 @@
 
 Прозрачная маршрутизация эндпоинтов [opencode](https://opencode.ai) и подключённых провайдеров моделей через VLESS-VPN. Весь остальной трафик хоста не затрагивается.
 
-**v1.2.0:** запуск в фоне (`--daemon`, терминал свободен), вотчдог лимитов — сам ловит
-IP-лимиты opencode/zen/go в логе opencode и переключается на ключ с **другим** exit IP,
-исчерпанные IP уходят в карантин. Для macOS есть GUI: одна кнопка + логи + авторотация.
+**v1.3.0:** запуск в фоне (`--daemon`, терминал свободен), вотчдог лимитов — сам ловит
+IP-лимиты opencode/zen/go в логе opencode и переключается на ключ с **другим**
+exit IP, исчерпанные IP уходят в карантин. При подключении **проверяется
+доступность моделей opencode из региона**: если все free-модели отдают
+геоблок — exit IP в карантин на 12 ч. `--restart` (новый ключ в фоне),
+`--new-ip` (сменить IP сейчас), `--subs URL|ФАЙЛ` (разовый источник ключей).
+Для macOS есть GUI: одна кнопка + логи + авторотация.
 
 ## Зачем
 
@@ -58,6 +62,9 @@ git clone git@github.com:OTumanov/ocvpn.git
 cd ocvpn
 ocvpn --daemon          # в фон, терминал свободен (лог /var/log/ocvpn.log)
 ocvpn --daemon --watch  # фон + вотчдог: сам ловит лимиты и ротирует IP
+ocvpn --new-ip          # сменить exit IP сейчас
+ocvpn --restart         # перезапустить в фоне: новый ключ + (обычно) новый IP
+ocvpn --subs https://… # разовый источник ключей (URL подписки или txt с vless://)
 ```
 
 На macOS — GUI: распаковать `dist/ocvpn-*-macos.tar.gz`, `sudo ./install.sh`,
@@ -80,9 +87,16 @@ ocvpn --daemon --watch  # фон + вотчдог: сам ловит лимит�
 | `ocvpn` | Запустить VPN в foreground (Ctrl-C = стоп + cleanup) |
 | `ocvpn --daemon [--watch]` | Запустить в фоне, терминал свободен (лог `/var/log/ocvpn.log`) |
 | `ocvpn --watch` | Вотчдог: следит за логом opencode, ловит IP-лимиты, дёргает `--rotate` |
-| `ocvpn --rotate [why]` | Разово переключиться на ключ с **другим** exit IP |
+| `ocvpn --new-ip` | Сменить exit IP сейчас (сигнал держателю) |
+| `ocvpn --rotate [why]` | То же, что `--new-ip` (алиас) |
+| `ocvpn --restart` | Перезапустить в фоне: прибить держателя, поднять новый ключ + (обычно) новый IP |
 | `ocvpn --status` | Состояние: xray, порты, маршруты, ключ, exit IP, карантин, вотчдог |
 | `ocvpn --cleanup` | Снять iptables/pf-правила, убрать форсировку IPv4 из `/etc/hosts` |
+
+`--subs URL|ФАЙЛ` можно передать в любом месте командной строки — это разовый
+источник ключей для запуска/рестарта: URL подписки или готовый txt с `vless://`
+(например `ocvpn --subs https://provider/sub --restart`). Постоянный источник —
+`OCVPN_SUBS_URL`/`~/.ocvpn-subs-url` (см. «Подписка»).
 
 ## Вотчдог лимитов и ротация
 
@@ -110,6 +124,23 @@ Free-tier opencode/zen/go лимитируется **по IP**: смена вы�
 Защита от флэппинга: cooldown 600 сек (`OCVPN_ROTATE_COOLDOWN`) + максимум 6 ротаций
 в час (`OCVPN_ROTATE_MAX_PER_HOUR`).
 
+## Geo-check: доступность моделей из региона
+
+При каждом подключении/ротации проверяется, что из текущего exit IP **действительно
+доступны модели opencode** (геоблок детектится не по IP-гео, а по ответу API).
+`check_model_available()` пробует 5 free-моделей через `api.opencode.ai`
+(SOCKS-прокси ropического ключа):
+
+- HTTP **200/201/429** — модель отвечает → регион рабочий → подключение принято
+- HTTP **403/451** (или geo-паттерн в ответе) — геоблок модели
+- **500/timeout** — трактуется как «неизвестно», не карантинится (не хочется
+  убивать рабочие IP из-за шума сети)
+
+Если **все** free-модели вернули геоблок — exit IP бесполезен: ключ уходит в
+карантин на **12 часов** (`geo-block: модели не доступны из региона`),
+подключение отменяется и пробуется следующий кандидат. Достаточно одной
+доступной модели, чтобы IP приняли за рабочий.
+
 ## Карантин
 
 Исчерпанный сервер (`host:port`) и его exit IP помечаются и не выбираются до истечения
@@ -117,7 +148,9 @@ Free-tier opencode/zen/go лимитируется **по IP**: смена вы�
 проверено по исходникам opencode: фиксированного N там нет, сервер присылает
 динамический reset через `x-ratelimit-reset`/`retry-after`, клиент показывает
 «Usage limit reached. It will reset in …»). Нет хинта — дефолт 6 часов
-(`OCVPN_QUARANTINE_HOURS`), потолок 168. Хранилище: `~/.local/share/ocvpn/quarantine.tsv`.
+(`OCVPN_QUARANTINE_HOURS`), потолок 168. Гео-заблокированные IP (все free-модели
+недоступны) карантинятся на **12 часов** с reason `geo-block: модели не доступны
+из региона`. Хранилище: `~/.local/share/ocvpn/quarantine.tsv`.
 
 ## Проверка, что VPN работает
 
@@ -139,7 +172,7 @@ ss -tnp | grep opencode
 ## Тесты
 
 ```bash
-bash ocvpn-tests.sh    # ожидается PASS=43 FAIL=0
+bash ocvpn-tests.sh    # ожидается PASS=59 FAIL=0
 ```
 
  Покрывает:
@@ -155,12 +188,17 @@ bash ocvpn-tests.sh    # ожидается PASS=43 FAIL=0
 - Парсинг `reset in N` → часы карантина (мин/часы/дни, дефолт, потолок 168)
 - Карантин: блок host:port и exit IP, expiry, count
 - Регрессия EXIT-trap: `--help/--version/--status` не пишут в iptables и не трогают `/etc/hosts`
+- `--new-ip` без держателя: чистая ошибка без побочек; `--help` анонсирует новые флаги
+- `parse_subs_flag`: файл / http(s)-URL / флаг после команды / мусор / пусто
+- `download_subscription`: с vless-ключами / нет файла / нет vless
+- Geo-check: наличие `check_model_available`/`FREE_MODELS`/`GEO_BLOCK_PATTERNS`,
+  карантин geo-заблокированного IP, пустой `auth.json` → пропуск проверки
 
 ## Установка пакетами
 
 ```bash
-make deb        # dist/ocvpn-1.2.0-all.deb  (Debian/Ubuntu, systemd-юнит ocvpn.service)
-make macos-tar  # dist/ocvpn-1.2.0-macos.tar.gz (macOS: ocvpn + OCVPN.app + LaunchDaemon)
+make deb        # dist/ocvpn-1.3.0-all.deb  (Debian/Ubuntu, systemd-юнит ocvpn.service)
+make macos-tar  # dist/ocvpn-1.3.0-macos.tar.gz (macOS: ocvpn + OCVPN.app + LaunchDaemon)
 ```
 
 Debian: `sudo dpkg -i dist/ocvpn-*.deb` (сервис включается, но не стартует сам —
@@ -210,7 +248,11 @@ OPENCODE_DOMAINS=(
 
 Поддерживаются plain-text и **base64** подписки (V2Board/Marzban). Приоритет URL:
 
-`OCVPN_SUBS_URL` (env) > `~/.ocvpn-subs-url` (файл) > встроенный fallback-список.
+`--subs URL|ФАЙЛ` (разово, из командной строки) > `OCVPN_SUBS_URL` (env) >
+`~/.ocvpn-subs-url` (файл) > встроенный fallback-список.
+
+`--subs` с **файлом** берёт готовый txt с `vless://` без скачивания — удобно
+тестировать конкретную подписку.
 
 ```bash
 printf '%s\n' 'https://provider.example/sub/TOKEN' > ~/.ocvpn-subs-url

@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import ttk
 
 APP_NAME = "OCVPN"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 STATE_DIR = os.environ.get(
     "OCVPN_STATE_DIR", os.path.expanduser("~/.local/share/ocvpn")
@@ -174,6 +174,9 @@ class App(tk.Tk):
         bot = ttk.Frame(self, padding=(12, 0, 12, 12))
         bot.pack(fill=tk.X)
         ttk.Button(bot, text="Обновить", command=self._tick).pack(side=tk.RIGHT)
+        ttk.Button(bot, text="Новый IP", command=self.on_newip).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
         self.hint_var = tk.StringVar(
             value="Лог: %s" % self.log_path if self.log_path else ""
         )
@@ -262,6 +265,13 @@ class App(tk.Tk):
         want = self.auto_var.get()
         self.after(100, lambda: self._run_auto(want))
 
+    def on_newip(self):
+        if self.busy or not self.backend:
+            return
+        self.busy = True
+        self._tick()
+        self.after(100, lambda: self._run_action("newip"))
+
     def _run_auto(self, want):
         try:
             if want:
@@ -290,6 +300,8 @@ class App(tk.Tk):
         try:
             if action == "start":
                 cmd = "bash '%s' --daemon" % self.backend
+            elif action == "newip":
+                cmd = "bash '%s' --new-ip" % self.backend
             else:
                 cmd = "bash '%s' --cleanup" % self.backend
             r = run_admin(cmd)
