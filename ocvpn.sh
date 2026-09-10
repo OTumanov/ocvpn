@@ -26,13 +26,19 @@ TMPDIR_BASE="/tmp/opencode-vpn"
 IPTABLES_CHAIN="OPENCODE_VPN"
 # Эндпоинты opencode, которые будут ходить через VPN
 OPENCODE_DOMAINS=(
-    "opencode.ai"
-    "api.opencode.ai"
-    "models.opencode.ai"
-    "app.opencode.ai"
-    "ai.zenifra.com"
-    "zenmux.ai"
-    "auth.openai.com"
+    # --- Инфраструктура OpenCode (v1.18.30) ---
+    "opencode.ai"          # console auth/device, /console/api/*, Zen (/zen/v1), Go (/zen/go/v1)
+    "api.opencode.ai"      # GitHub App интеграция
+    "models.opencode.ai"   # каталог моделей (models.json)
+    "app.opencode.ai"      # upstream веб-UI сервера
+    "opncd.ai"             # share-сервис
+    # --- Провайдеры моделей (из ~/.local/share/opencode/auth.json) ---
+    "api.deepseek.com"     # DeepSeek
+    "ollama.com"           # Ollama Cloud
+    "api.ollama.com"
+    "openrouter.ai"        # OpenRouter
+    "zenmux.ai"            # ZenMux
+    "auth.openai.com"      # OpenAI OAuth
 )
 
 # === Colors ===
