@@ -2,6 +2,10 @@
 
 Прозрачная маршрутизация эндпоинтов [opencode](https://opencode.ai) и подключённых провайдеров моделей через VLESS-VPN. Весь остальной трафик хоста не затрагивается.
 
+**v1.2.0:** запуск в фоне (`--daemon`, терминал свободен), вотчдог лимитов — сам ловит
+IP-лимиты opencode/zen/go в логе opencode и переключается на ключ с **другим** exit IP,
+исчерпанные IP уходят в карантин. Для macOS есть GUI: одна кнопка + логи + авторотация.
+
 ## Зачем
 
 free-тариф opencode лимитирует по IP (без device_id). Смена IP сбрасывает лимиты. Скрипт каждый запуск выбирает случайный рабочий сервер из твоей подписки — новый выходной IP.
@@ -52,8 +56,12 @@ free-тариф opencode лимитирует по IP (без device_id). Сме
 ```bash
 git clone git@github.com:OTumanov/ocvpn.git
 cd ocvpn
-bash ocvpn.sh
+ocvpn --daemon          # в фон, терминал свободен (лог /var/log/ocvpn.log)
+ocvpn --daemon --watch  # фон + вотчдог: сам ловит лимиты и ротирует IP
 ```
+
+На macOS — GUI: распаковать `dist/ocvpn-*-macos.tar.gz`, `sudo ./install.sh`,
+открыть `/Applications/OCVPN.app`: одна кнопка + логи + чекбокс авторотации.
 
 Скрипт автоматически:
 - Установит xray (если не найден) в `~/.local/opt/xray`
@@ -69,8 +77,47 @@ bash ocvpn.sh
 
 | Команда | Описание |
 |---------|----------|
-| `bash ocvpn.sh` | Запустить VPN, найти рабочий ключ, настроить маршрутизацию |
-| `bash ocvpn.sh --cleanup` | Снять iptables-правила, убрать форсировку IPv4 из `/etc/hosts` |
+| `ocvpn` | Запустить VPN в foreground (Ctrl-C = стоп + cleanup) |
+| `ocvpn --daemon [--watch]` | Запустить в фоне, терминал свободен (лог `/var/log/ocvpn.log`) |
+| `ocvpn --watch` | Вотчдог: следит за логом opencode, ловит IP-лимиты, дёргает `--rotate` |
+| `ocvpn --rotate [why]` | Разово переключиться на ключ с **другим** exit IP |
+| `ocvpn --status` | Состояние: xray, порты, маршруты, ключ, exit IP, карантин, вотчдог |
+| `ocvpn --cleanup` | Снять iptables/pf-правила, убрать форсировку IPv4 из `/etc/hosts` |
+
+## Вотчдог лимитов и ротация
+
+Free-tier opencode/zen/go лимитируется **по IP**: смена выходного IP сбрасывает лимит.
+Вотчдог (`ocvpn --watch`, обычно вместе с `--daemon`) хвостом читает лог opencode
+(`~/.local/share/opencode/log/opencode.log`) и при строках вида:
+
+- `AI_APICallError: Rate limit exceeded. Please try again later.`
+- `Error from provider (Console): Rate limit exceeded…`
+- `… usage limit reached. It will reset in N minutes/hours …`
+- `Too many requests` / `429` от zen
+
+шлёт держателю сигнал — тот кладёт исчерпанный IP в карантин и поднимает ключ
+с **другим** exit IP. Старый ключ гасится только после проверки нового — обрыва нет.
+Новый opencode-переподключать не надо: `iptables nat OUTPUT` / `pf rdr` ловят только
+новые соединения, следующие запросы сами уйдут через новый IP (in-flight запрос упадёт).
+
+**Не триггерят** (смена IP не поможет, ollama вообще игнорируется):
+
+- `ollama.com/upgrade`, `ollama.com/settings` — лимиты аккаунта ollama
+- `Insufficient balance`, `/billing` — деньги, а не IP
+- `not available in your country` — геоблок
+- `Forbidden`, `Model is disabled`, `Cannot connect`, `Task cancelled`
+
+Защита от флэппинга: cooldown 600 сек (`OCVPN_ROTATE_COOLDOWN`) + максимум 6 ротаций
+в час (`OCVPN_ROTATE_MAX_PER_HOUR`).
+
+## Карантин
+
+Исчерпанный сервер (`host:port`) и его exit IP помечаются и не выбираются до истечения
+срока. Сколько часов — по хинту из строки лимита (`reset in N minutes/hours/days`,
+проверено по исходникам opencode: фиксированного N там нет, сервер присылает
+динамический reset через `x-ratelimit-reset`/`retry-after`, клиент показывает
+«Usage limit reached. It will reset in …»). Нет хинта — дефолт 6 часов
+(`OCVPN_QUARANTINE_HOURS`), потолок 168. Хранилище: `~/.local/share/ocvpn/quarantine.tsv`.
 
 ## Проверка, что VPN работает
 
@@ -92,10 +139,10 @@ ss -tnp | grep opencode
 ## Тесты
 
 ```bash
-bash ocvpn-tests.sh    # ожидается PASS=5 FAIL=0
+bash ocvpn-tests.sh    # ожидается PASS=43 FAIL=0
 ```
 
-Покрывает:
+ Покрывает:
 - Парсинг всех типов VLESS-конфигов (reality, ws, tls, grpc, xhttp)
 - Декодирование URL-encoded параметров (path, sni)
 - Xray 26: `xhttpSettings` (host строкой, mode), а не устаревший `httpSettings`
@@ -103,6 +150,23 @@ bash ocvpn-tests.sh    # ожидается PASS=5 FAIL=0
 - Фильтр поддерживаемых ключей (`is_supported_key`)
 - Индемпотентность `/etc/hosts` (не плодит дубликаты при повторных запусках)
 - Парсинг 5 реальных ключей из живой подписки
+- CLI (`--help/--version/--status`) и macOS-ветку (резолв, pf-якорь, диспетчер — на стабах)
+- Вотчдог: 15 +/-кейсов лимитов (zen/console — да; ollama/биллинг/гео/сеть — нет)
+- Парсинг `reset in N` → часы карантина (мин/часы/дни, дефолт, потолок 168)
+- Карантин: блок host:port и exit IP, expiry, count
+- Регрессия EXIT-trap: `--help/--version/--status` не пишут в iptables и не трогают `/etc/hosts`
+
+## Установка пакетами
+
+```bash
+make deb        # dist/ocvpn-1.2.0-all.deb  (Debian/Ubuntu, systemd-юнит ocvpn.service)
+make macos-tar  # dist/ocvpn-1.2.0-macos.tar.gz (macOS: ocvpn + OCVPN.app + LaunchDaemon)
+```
+
+Debian: `sudo dpkg -i dist/ocvpn-*.deb` (сервис включается, но не стартует сам —
+старт: `systemctl start ocvpn`). macOS: распаковать архив, `sudo ./install.sh`;
+`.pkg` собирается на самом Mac: `bash packaging/macos/build-pkg.sh`.
+Нативный SwiftUI-GUI: `bash gui-swift/build.sh` (только на Mac).
 
 ## Конфигурация
 
@@ -184,9 +248,9 @@ SOCKS5 и HTTP прокси слушают только на `127.0.0.1` — н�
 
 ## Зависимости
 
-- `curl`, `python3`, `unzip`, `iptables`
-- Рут (для iptables и установки xray)
-- Linux (проверено на Ubuntu и в Docker с `NET_ADMIN`)
+- `curl`, `python3`, `unzip` + `iptables` (Linux) / `pfctl`, `dig` (macOS)
+- Рут (для iptables/pf и установки xray)
+- Linux (iptables REDIRECT) или macOS (pf rdr через якорь `com.otumanov.ocvpn`)
 - Ядро с поддержкой `owner` модуля iptables (рекомендуется; скрипт работает и без, но с небольшой оговоркой — смотрите раздел «Ограничения»)
 
 ## Лицензия

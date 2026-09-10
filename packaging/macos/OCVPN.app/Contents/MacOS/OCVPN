@@ -1,0 +1,3 @@
+#!/bin/sh
+# Лаунчер OCVPN.app — tkinter-GUI из установленного пакета.
+exec /usr/bin/python3 "/usr/local/lib/ocvpn/ocvpn-gui.py"

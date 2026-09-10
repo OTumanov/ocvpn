@@ -1,0 +1,16 @@
+[Unit]
+Description=ocvpn — transparent routing of opencode endpoints through VLESS VPN
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ocvpn
+ExecStop=/usr/local/bin/ocvpn --cleanup
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/ocvpn.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

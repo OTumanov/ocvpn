@@ -1,0 +1,13 @@
+#!/bin/sh
+# postinst: включаем сервис, но НЕ стартуем автоматически —
+# старт может конфликтовать с уже запущенным вручную ocvpn (порты 10808/10809/12345).
+set -e
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    systemctl enable ocvpn.service || true
+    echo "ocvpn: сервис включён. Запуск: systemctl start ocvpn (терминал свободен, лог /var/log/ocvpn.log)"
+else
+    echo "ocvpn: systemd не найден — запуск вручную: ocvpn --daemon"
+fi
+#DEBHELPER#
+exit 0

@@ -1,0 +1,14 @@
+#!/bin/sh
+# prerm: останавливаем сервис и снимаем маршруты при удалении пакета.
+set -e
+case "$1" in
+    remove|purge|deconfigure)
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+            systemctl stop ocvpn.service 2>/dev/null || true
+            systemctl disable ocvpn.service 2>/dev/null || true
+        fi
+        /usr/local/bin/ocvpn --cleanup 2>/dev/null || true
+        ;;
+esac
+#DEBHELPER#
+exit 0

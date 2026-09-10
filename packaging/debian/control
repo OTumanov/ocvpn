@@ -1,0 +1,15 @@
+Package: ocvpn
+Version: 1.2.0
+Section: net
+Priority: optional
+Architecture: all
+Depends: bash, curl, python3, unzip, iptables, procps
+Maintainer: OTumanov
+Description: Transparent routing of opencode endpoints through VLESS VPN
+ ocvpn routes only traffic to opencode.ai infrastructure and configured
+ model-provider endpoints (port 443) through a VLESS VPN via xray,
+ using iptables REDIRECT on Linux and pf rdr on macOS.
+ Everything else on the host goes direct.
+ .
+ Ships a systemd unit (daemon mode, terminal stays free) and a macOS
+ GUI app (one button + logs).

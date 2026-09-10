@@ -196,6 +196,217 @@ if [[ -s "$SUBS_TEST" ]]; then
     fi
 fi
 
+# ==== 4. CLI-флаги и macOS-ветка (стабы, систему не трогаем) ====
+echo ""
+echo "[4] CLI и Darwin-dispatch (стабы)"
+
+if bash "$SCRIPT" --help 2>/dev/null | grep -q -- "--daemon"; then
+    PASS=$((PASS+1)); echo "  ▸ --help: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ --help: FAIL"
+fi
+
+if bash "$SCRIPT" --version 2>/dev/null | grep -qE '^ocvpn [0-9]+\.[0-9]+\.[0-9]+$'; then
+    PASS=$((PASS+1)); echo "  ▸ --version: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ --version: FAIL"
+fi
+
+ST_OUT="$(bash "$SCRIPT" --status 2>/dev/null || true)"
+if echo "$ST_OUT" | grep -q "^xray: " && echo "$ST_OUT" | grep -q "^порт 10808: " \
+    && echo "$ST_OUT" | grep -q "^маршруты " && echo "$ST_OUT" | grep -q "^/etc/hosts: "; then
+    PASS=$((PASS+1)); echo "  ▸ --status (секции): OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ --status (секции): FAIL"
+fi
+
+# Стабы Darwin-утилит (НЕ в /tmp: он бывает noexec — стабы бы не запустились)
+STUBROOT="$(mktemp -d "${HOME}/.cache/ovpn-tests-XXXXXX")"
+STUB="$STUBROOT/darwin-stub"
+mkdir -p "$STUB"
+cat > "$STUB/uname" <<'STUB_EOF'
+#!/bin/bash
+echo "Darwin"
+STUB_EOF
+cat > "$STUB/dscacheutil" <<'STUB_EOF'
+#!/bin/bash
+# dscacheutil -q host -a name <domain> -> один IPv4
+echo "name: stub.example"
+echo "ip_address: 93.184.216.34"
+STUB_EOF
+cat > "$STUB/dig" <<'STUB_EOF'
+#!/bin/bash
+echo "93.184.216.34"
+STUB_EOF
+cat > "$STUB/pfctl" <<'STUB_EOF'
+#!/bin/bash
+# pfctl -e | -f ... | -s rules : всегда успех, правил нет
+exit 0
+STUB_EOF
+cat > "$STUB/iptables" <<'STUB_EOF'
+#!/bin/bash
+echo "STUB-iptables-called-unexpectedly" >&2
+exit 1
+STUB_EOF
+chmod +x "$STUB"/*
+DARWIN_LOAD="$TESTS_DIR/darwin-func.sh"
+sed '/# === Main ===/,$d' "$SCRIPT" > "$DARWIN_LOAD"
+printf 'trap - EXIT\n' >> "$DARWIN_LOAD"
+cat >> "$DARWIN_LOAD" <<'INJECT2'
+# pf/hosts пути — во временные файлы, /etc не трогаем
+PF_ANCHOR_FILE="$TESTS_DIR/pf.anchor"
+PF_CONF="$TESTS_DIR/pf.conf"
+: > "$PF_CONF"
+OPENCODE_DOMAINS=("stub.example")
+
+echo "DARWIN_OS=$OCVPN_OS"
+echo "DARWIN_RESOLVE=$(resolve_ipv4 stub.example)"
+pf_anchor_content > "$TESTS_DIR/anchor.txt"
+echo "ANCHOR_HAS_TABLE=$(grep -c '<ocvpn_targets>' "$TESTS_DIR/anchor.txt")"
+echo "ANCHOR_HAS_RDR=$(grep -c 'rdr pass on lo0' "$TESTS_DIR/anchor.txt")"
+echo "ANCHOR_HAS_IP=$(grep -c '93.184.216.34' "$TESTS_DIR/anchor.txt")"
+pf_ensure_refs
+pf_ensure_refs  # повтор — без дубликатов
+echo "REFS_COUNT=$(grep -c -- "$PF_MARK" "$PF_CONF")"
+pf_remove_refs
+echo "REFS_AFTER_CLEAN=$(grep -c -- "$PF_MARK" "$PF_CONF" || true)"
+# диспетчер обязан выбрать darwin-ветку и НЕ звать iptables
+setup_routes_darwin() { echo "DARWIN_DISPATCH"; }
+setup_routes
+INJECT2
+DARWIN_OUT="$(PATH="$STUB:$PATH" bash "$DARWIN_LOAD" 2>/dev/null)"
+
+check_darwin() { # $1=имя $2=ожидаемая строка
+    if echo "$DARWIN_OUT" | grep -qF "$2"; then
+        PASS=$((PASS+1)); echo "  ▸ $1: OK"
+    else
+        FAIL=$((FAIL+1)); echo "  ▸ $1: FAIL"
+    fi
+}
+check_darwin "darwin OS-detect" "DARWIN_OS=Darwin"
+check_darwin "darwin resolve" "DARWIN_RESOLVE=93.184.216.34"
+check_darwin "darwin anchor" "ANCHOR_HAS_RDR=1"
+check_darwin "darwin anchor IP" "ANCHOR_HAS_IP=1"
+check_darwin "darwin refs идемпотентны" "REFS_COUNT=3"
+check_darwin "darwin refs cleanup" "REFS_AFTER_CLEAN=0"
+check_darwin "darwin dispatch" "DARWIN_DISPATCH"
+rm -rf "$STUBROOT"
+
+# ==== 5. Вотчдог: лимиты opencode/zen/go, карантин, trap-регрессия ====
+echo ""
+echo "[5] Вотчдог лимитов и карантин"
+
+limit_case() { # $1=want(yes/no) $2=имя $3=строка
+    local want="$1" name="$2" line="$3" got="no"
+    if is_rotatable_limit "$line"; then got="yes"; fi
+    if [[ "$got" == "$want" ]]; then
+        PASS=$((PASS+1)); echo "  ▸ лимит $name: OK"
+    else
+        FAIL=$((FAIL+1)); echo "  ▸ лимит $name: FAIL (want=$want got=$got)"
+    fi
+}
+
+# Реальные образцы из лога opencode (IP-лимиты zen/console → ротируем)
+limit_case yes "zen rate-limit" 'error.error="AI_APICallError: Rate limit exceeded. Please try again later.'
+limit_case yes "console rate-limit" 'error.error="AI_APICallError: Error from provider (Console): Rate limit exceeded. Please try again later.'
+limit_case yes "too-many" 'Upstream error: Too many requests, retry in 30s'
+limit_case yes "http-429" 'request failed with status 429 from zen'
+limit_case yes "reset-hint" 'Grok usage limit reached. It will reset in 25 minutes. To continue enable balance'
+limit_case yes "account-rate" 'action.reason=account_rate_limit Usage limit reached. It will reset in 2 hours'
+# Аккаунтное/гео/сеть (смена IP не поможет → НЕ ротируем; ollama игнорим целиком)
+limit_case no "ollama-weekly" 'you (otumanov) have reached your weekly usage limit, upgrade: https://ollama.com/upgrade'
+limit_case no "ollama-session" 'you (otumanov) have reached your session usage limit: https://ollama.com/settings'
+limit_case no "billing" 'Insufficient balance. Manage your billing here: https://opencode.ai/workspace/wrk_01/billing'
+limit_case no "geo" 'AI_APICallError: This model is not available in your country.'
+limit_case no "forbidden" 'AI_APICallError: Forbidden'
+limit_case no "model-off" 'AI_APICallError: Model is disabled'
+limit_case no "net" 'AI_APICallError: Cannot connect to API: Unable to connect.'
+limit_case no "cancel" 'Error: Task cancelled by user'
+limit_case no "sql-noise" "SELECT * FROM uljsu_posts ORDER BY post_modified DESC LIMIT 20;"
+
+reset_case() { # $1=want_hours $2=имя $3=строка
+    local want="$1" name="$2" line="$3" got
+    got="$(parse_reset_hours "$line")"
+    if [[ "$got" == "$want" ]]; then
+        PASS=$((PASS+1)); echo "  ▸ reset $name: OK"
+    else
+        FAIL=$((FAIL+1)); echo "  ▸ reset $name: FAIL (want=$want got=$got)"
+    fi
+}
+reset_case 1 "минуты" "It will reset in 25 minutes."
+reset_case 3 "часы" "It will reset in 3 hours."
+reset_case 48 "дни" "It will reset in 2 days."
+reset_case "$QUARANTINE_HOURS" "дефолт" "Rate limit exceeded. Please try again later."
+reset_case 168 "потолок" "It will reset in 200 days."
+
+# Карантин — на изолированном стейте
+OCVPN_STATE_DIR="$TESTS_DIR/wstate"
+QUARANTINE_FILE="$OCVPN_STATE_DIR/quarantine.tsv"
+quarantine_add "1.2.3.4" "8443" "5.6.7.8" "test-limit" 6
+if quarantine_blocked "1.2.3.4" "8443" ""; then
+    PASS=$((PASS+1)); echo "  ▸ карантин host:port: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ карантин host:port: FAIL"
+fi
+if quarantine_blocked "" "" "5.6.7.8"; then
+    PASS=$((PASS+1)); echo "  ▸ карантин exit-ip: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ карантин exit-ip: FAIL"
+fi
+if quarantine_blocked "9.9.9.9" "443" "" || quarantine_blocked "" "" "9.9.9.9"; then
+    FAIL=$((FAIL+1)); echo "  ▸ карантин чужой: FAIL"
+else
+    PASS=$((PASS+1)); echo "  ▸ карантин чужой: OK"
+fi
+quarantine_add "9.9.9.9" "443" "9.9.9.9" "expired" 0
+sleep 1
+if quarantine_blocked "9.9.9.9" "443" ""; then
+    FAIL=$((FAIL+1)); echo "  ▸ карантин expiry: FAIL"
+else
+    PASS=$((PASS+1)); echo "  ▸ карантин expiry: OK"
+fi
+if [[ "$(quarantine_count)" == "1" ]]; then
+    PASS=$((PASS+1)); echo "  ▸ карантин count: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ карантин count: FAIL ($(quarantine_count))"
+fi
+
+# Trap-регрессия: read-only режимы не делают ЗАПИСЕЙ в iptables и не трогают hosts
+# (стаб — НЕ в /tmp: там noexec)
+TRAPROOT="$(mktemp -d "${HOME}/.cache/ovpn-traptest-XXXXXX")"
+TRAPSTUB="$TRAPROOT/stub"
+mkdir -p "$TRAPSTUB"
+cat > "$TRAPSTUB/iptables" <<'STUB_EOF'
+#!/bin/bash
+echo "iptables $@" >> "$TRAP_CALLS"
+exit 1
+STUB_EOF
+chmod +x "$TRAPSTUB/iptables"
+export TRAP_CALLS="$TESTS_DIR/trap-calls.log"
+: > "$TRAP_CALLS"
+HOSTS_MD5_BEFORE="$(md5sum /etc/hosts | awk '{print $1}')"
+PATH="$TRAPSTUB:$PATH" bash "$SCRIPT" --help >/dev/null 2>&1
+PATH="$TRAPSTUB:$PATH" bash "$SCRIPT" --version >/dev/null 2>&1
+if [[ -s "$TRAP_CALLS" ]]; then
+    FAIL=$((FAIL+1)); echo "  ▸ trap help/version: FAIL (iptables вызывался)"
+else
+    PASS=$((PASS+1)); echo "  ▸ trap help/version: OK"
+fi
+: > "$TRAP_CALLS"
+PATH="$TRAPSTUB:$PATH" bash "$SCRIPT" --status >/dev/null 2>&1 || true
+if grep -qE 'iptables (-A|-D|-F|-X|-N)' "$TRAP_CALLS"; then
+    FAIL=$((FAIL+1)); echo "  ▸ trap status-записи: FAIL"
+else
+    PASS=$((PASS+1)); echo "  ▸ trap status-записи: OK"
+fi
+HOSTS_MD5_AFTER="$(md5sum /etc/hosts | awk '{print $1}')"
+if [[ "$HOSTS_MD5_BEFORE" == "$HOSTS_MD5_AFTER" ]]; then
+    PASS=$((PASS+1)); echo "  ▸ trap hosts-нетронут: OK"
+else
+    FAIL=$((FAIL+1)); echo "  ▸ trap hosts-нетронут: FAIL"
+fi
+rm -rf "$TRAPROOT"
+
 echo ""
 echo "Итог: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
