@@ -57,6 +57,10 @@ else
 fi
 run_batch "coverage (tests/ocvpn-coverage.sh)" "$LIMIT" bash "$HERE/ocvpn-coverage.sh"
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    run_batch "macOS app bundle (tests/macos-app-test.sh)" "$LIMIT" bash "$HERE/macos-app-test.sh"
+fi
+
 echo
 if [[ $RC_ALL -eq 0 ]]; then
     echo "ВСЕ БАТЧИ: OK"
