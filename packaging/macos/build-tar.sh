@@ -29,6 +29,11 @@ chmod +x "$STAGE/$PKG/OCVPN.app/Contents/MacOS/OCVPN" \
          "$STAGE/$PKG/install.sh" "$STAGE/$PKG/uninstall.sh" "$STAGE/$PKG/build-pkg.sh" \
          "$STAGE/$PKG/gui-swift/build.sh" "$STAGE/$PKG/gui-swift/build-app.sh"
 
+# ad-hoc подпись: без неё Gatekeeper на macOS пишет «приложение повреждено».
+if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+    codesign --force --deep --sign - "$STAGE/$PKG/OCVPN.app" 2>/dev/null || true
+fi
+
 mkdir -p "$DIST"
 tar -czf "$DIST/$PKG.tar.gz" -C "$STAGE" "$PKG"
 echo "Готово: $DIST/$PKG.tar.gz"
