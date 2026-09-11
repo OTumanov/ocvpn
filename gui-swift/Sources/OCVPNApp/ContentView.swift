@@ -614,7 +614,9 @@ private func tailLog(_ n: Int) -> String {
     let start: UInt64 = end > 32768 ? end - 32768 : 0
     try? fh.seek(toOffset: start)
     let data = (try? fh.read(upToCount: 32768)) ?? Data()
-    guard let text = String(data: data, encoding: .utf8) else { return "" }
+    // lossy-декод: срез с произвольного байта может разрезать UTF-8 символ,
+    // строгий String(data:encoding:) тогда вернул бы nil и лог был бы пустым.
+    let text = String(decoding: data, as: UTF8.self)
     let clean = text.replacingOccurrences(
         of: "\u{1B}\\[[0-9;]*m", with: "", options: .regularExpression
     )
