@@ -5,7 +5,7 @@ set -euo pipefail
 # (в частности под sudo/systemd с урезанным PATH). Добавляем, не затирая остальное.
 export PATH="/usr/sbin:/sbin:$PATH"
 
-OCVPN_VERSION="1.5.3"
+OCVPN_VERSION="1.5.4"
 # Linux (iptables REDIRECT) или macOS (pf rdr). Определяем один раз.
 OCVPN_OS="$(uname -s 2>/dev/null || echo Linux)"
 is_macos() { [[ "$OCVPN_OS" == "Darwin" ]]; }
@@ -66,7 +66,9 @@ PF_ANCHOR_FILE="/etc/pf.anchors/$PF_ANCHOR"
 PF_CONF="/etc/pf.conf"
 PF_MARK="# ocvpn anchor"
 OCVPN_LOG="${OCVPN_LOG:-/var/log/ocvpn.log}"
-# Эндпоинты opencode, которые будут ходить через VPN
+# Эндпоинты opencode, которые будут ходить через VPN.
+# ВАЖНО: api.deepseek.com и ollama.com/api.ollama.com НЕ в списке — они ходят
+# напрямую (DIRECT), их через VPN не заворачиваем.
 OPENCODE_DOMAINS=(
     # --- Инфраструктура OpenCode (v1.18.30) ---
     "opencode.ai"          # console auth/device, /console/api/*, Zen (/zen/v1), Go (/zen/go/v1)
@@ -74,10 +76,7 @@ OPENCODE_DOMAINS=(
     "models.opencode.ai"   # каталог моделей (models.json)
     "app.opencode.ai"      # upstream веб-UI сервера
     "opncd.ai"             # share-сервис
-    # --- Провайдеры моделей (из ~/.local/share/opencode/auth.json) ---
-    "api.deepseek.com"     # DeepSeek
-    "ollama.com"           # Ollama Cloud
-    "api.ollama.com"
+    # --- Провайдеры моделей, которым нужен VPN ---
     "openrouter.ai"        # OpenRouter
     "zenmux.ai"            # ZenMux
     "auth.openai.com"      # OpenAI OAuth
@@ -1057,18 +1056,30 @@ print(str(d.get('add',''))+' '+str(d.get('port','')))" 2>/dev/null) || return 1
     printf '%s %s' "${hostport%:*}" "${hostport##*:}"
 }
 
-# === Отбор N случайных ключей по короткому TCP-пингу ===
+# Пул непробованных поддерживаемых ключей (исключая строки из tried_file).
+candidate_pool() {
+    local subs_file="$1" tried_file="${2:-}" u
+    while IFS= read -r u; do
+        [[ -z "$u" ]] && continue
+        is_supported_key "$u" || continue
+        if [[ -n "$tried_file" && -s "$tried_file" ]] \
+            && grep -qxF -- "$u" "$tried_file" 2>/dev/null; then
+            continue
+        fi
+        printf '%s\n' "$u"
+    done < <(grep -E "$SUPPORTED_RE" "$subs_file")
+}
+
+# === Отбор N случайных НЕпробованных ключей по короткому TCP-пингу ===
+# $2 — файл уже забракованных ключей (исключаются в текущем цикле).
 # Вывод: "<latency>\t<url>" (устойчиво к пробелам в URL/названии).
 select_candidates() {
-    local subs_file="$1"
+    local subs_file="$1" tried_file="${2:-}"
     local poolfile="$TMPDIR/pool.txt"
-    # mapfile нет в bash 3.2 (macOS) — читаем строки в массив портируемо.
     local pool=()
     while IFS= read -r u; do
         pool+=("$u")
-    done < <(grep -E "$SUPPORTED_RE" "$subs_file" | while IFS= read -r u; do
-        is_supported_key "$u" && echo "$u"
-    done | shuffle | head -n "${BATCH_SIZE}")
+    done < <(candidate_pool "$subs_file" "$tried_file" | shuffle | head -n "${BATCH_SIZE}")
     printf '%s\n' "${pool[@]:-}" > "$poolfile" 2>/dev/null || true
 
     # Параллельный пинг всех N
@@ -1453,111 +1464,122 @@ fetch_subscription() {
     log "Найдено $total серверов."
 }
 
-# pick_working_key [exclude_ip]: перебирает кандидатов, поднимает рабочий xray.
-# Успех → 0; установлены XRAY_PID, ACTIVE_LABEL/HOST/PORT/EXIT_IP. xray ОСТАЁТСЯ запущен.
-# Кандидаты из карантина и с exclude_ip пропускаются (нужен ДРУГОЙ выходной IP).
-pick_working_key() {
-    local exclude_ip="${1:-}"
-    local candidates=()
-    while IFS= read -r __c; do
-        candidates+=("$__c")
-    done < <(select_candidates "$SUBS_FILE")
+# Пробует один ключ: поднимает xray, проверяет HTTP 204/exit IP/geo/карантин.
+# Успех → 0 и заполнены ACTIVE_*; иначе 1 (xray гасится). exclude_ip — нужен другой IP.
+try_key() { # url host port exclude_ip label idx total
+    local url="$1" host="$2" cport="$3" exclude_ip="$4" label="$5" idx="$6" total="$7"
+    warn "[$idx/$total] Пробую: $label ($host:$cport)"
 
-    if [[ ${#candidates[@]} -eq 0 ]]; then
-        err "Ни один из ${BATCH_SIZE} серверов не ответил на ping. Пробую расширенный пул..."
-        while IFS= read -r __c; do
-            candidates+=("$__c")
-        done < <(grep -E "$SUPPORTED_RE" "$SUBS_FILE" | while IFS= read -r u; do
-            is_supported_key "$u" && echo "$u"
-        done | shuffle | head -n "${MAX_TRIES}" \
-            | while IFS= read -r url; do
-                printf '99999\t%s\n' "$url"
-            done)
-    fi
+    local workdir="$TMPDIR/node_${idx}_$$"
+    mkdir -p "$workdir"
+    uri_to_xray "$url" "$workdir" || { warn "  не собрать конфиг, пропускаю"; return 1; }
 
-    if [[ ${#candidates[@]} -eq 0 ]]; then
-        err "Нет кандидатов для подключения."
+    "$XRAY_BIN" run -c "$workdir/config.json" &>/dev/null &
+    XRAY_PID=$!
+    sleep 1
+    if ! kill -0 "$XRAY_PID" 2>/dev/null; then
+        warn "  xray не запустился, пропускаю"
         return 1
     fi
 
-    log "Кандидаты (по пингу):"
-    local tried=0
-    for cand in "${candidates[@]}"; do
-        tried=$((tried+1))
-        local host cport url hp
-        url="${cand#*$'\t'}"
-        hp="$(url_host_port "$url")" || { warn "  не разобрать URL, пропускаю"; continue; }
-        host="${hp% *}"; cport="${hp##* }"
-        [[ -n "$url" && -n "$host" && -n "$cport" ]] \
-            || { warn "  нет host:port у кандидата, пропускаю"; continue; }
-        if quarantine_blocked "$host" "$cport" ""; then
-            warn "  ${host}:${cport} в карантине, пропускаю"
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' \
+        --proxy "socks5h://127.0.0.1:$SOCKS_PORT" \
+        --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" \
+        "$TEST_URL" 2>/dev/null || true)
+    if [[ "$code" != "204" ]]; then
+        warn "  Не работает (HTTP $code)"
+        kill "$XRAY_PID" 2>/dev/null || true
+        wait "$XRAY_PID" 2>/dev/null || true
+        return 1
+    fi
+
+    local exit_ip
+    exit_ip="$(current_exit_ip)"
+    if [[ -n "$exclude_ip" && "$exit_ip" == "$exclude_ip" ]]; then
+        warn "  тот же exit IP ($exit_ip) — нужен ДРУГОЙ, пропускаю"
+        kill "$XRAY_PID" 2>/dev/null || true
+        wait "$XRAY_PID" 2>/dev/null || true
+        return 1
+    fi
+    if [[ -n "$exit_ip" ]] && quarantine_blocked "" "" "$exit_ip"; then
+        warn "  exit IP $exit_ip в карантине, пропускаю"
+        kill "$XRAY_PID" 2>/dev/null || true
+        wait "$XRAY_PID" 2>/dev/null || true
+        return 1
+    fi
+    if ! check_model_available; then
+        warn "  exit IP $exit_ip: модели заблокированы по региону — карантин 12 ч"
+        quarantine_add "$host" "$cport" "$exit_ip" "geo-block: модели не доступны из региона" 12
+        kill "$XRAY_PID" 2>/dev/null || true
+        wait "$XRAY_PID" 2>/dev/null || true
+        return 1
+    fi
+
+    ACTIVE_LABEL="$label"
+    ACTIVE_HOST="$host"
+    ACTIVE_PORT="$cport"
+    ACTIVE_EXIT_IP="$exit_ip"
+    log "  РАБОТАЕТ! (HTTP $code, exit IP ${exit_ip:-?})"
+    return 0
+}
+
+# pick_working_key [exclude_ip]: идёт по пулу БАТЧАМИ, исключая уже забракованные
+# в текущем цикле, и повторяет, пока не подключится. Когда пул исчерпан —
+# перекачивает подписку и продолжает (до max_cycles циклов).
+pick_working_key() {
+    local exclude_ip="${1:-}"
+    local tried_file="$TMPDIR/tried.txt"
+    : > "$tried_file"
+    local cycle=0 max_cycles=5
+
+    while :; do
+        local candidates=()
+        while IFS= read -r __c; do candidates+=("$__c"); done \
+            < <(select_candidates "$SUBS_FILE" "$tried_file")
+
+        # пинг никого не дал — берём любые непробованные из пула
+        if [[ ${#candidates[@]} -eq 0 ]]; then
+            local u
+            while IFS= read -r u; do
+                candidates+=("99999"$'\t'"$u")
+            done < <(candidate_pool "$SUBS_FILE" "$tried_file" | shuffle | head -n "${BATCH_SIZE}")
+        fi
+
+        if [[ ${#candidates[@]} -eq 0 ]]; then
+            cycle=$((cycle + 1))
+            if [[ $cycle -gt $max_cycles ]]; then
+                err "Перебрал весь пул ($cycle циклов) — рабочего ключа нет."
+                return 1
+            fi
+            err "Пул исчерпан — обновляю подписку и продолжаю (цикл $cycle/$max_cycles)…"
+            fetch_subscription || return 1
+            : > "$tried_file"
             continue
         fi
 
-        local label
-        label=$(echo "$url" | sed -n 's|^.*#\([^"]*\)$|\1|p' | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip())[:50])" 2>/dev/null || echo "node-$tried-${host}")
-
-        warn "[$tried/${#candidates[@]}] Пробую: $label ($host:$cport)"
-
-        local workdir="$TMPDIR/node_$tried"
-        mkdir -p "$workdir"
-
-        uri_to_xray "$url" "$workdir" || { warn "  не собрать конфиг, пропускаю"; continue; }
-
-        "$XRAY_BIN" run -c "$workdir/config.json" &>/dev/null &
-        XRAY_PID=$!
-        sleep 1
-
-        if ! kill -0 "$XRAY_PID" 2>/dev/null; then
-            warn "  xray не запустился, пропускаю"
-            continue
-        fi
-
-        local code
-        code=$(curl -s -o /dev/null -w '%{http_code}' \
-            --proxy "socks5h://127.0.0.1:$SOCKS_PORT" \
-            --connect-timeout "$TIMEOUT" \
-            --max-time "$TIMEOUT" \
-            "$TEST_URL" 2>/dev/null || true)
-
-        if [[ "$code" == "204" ]]; then
-            local exit_ip
-            exit_ip="$(current_exit_ip)"
-            if [[ -n "$exclude_ip" && "$exit_ip" == "$exclude_ip" ]]; then
-                warn "  тот же exit IP ($exit_ip) — нужен ДРУГОЙ, пропускаю"
-                kill "$XRAY_PID" 2>/dev/null || true
-                wait "$XRAY_PID" 2>/dev/null || true
+        log "Кандидаты (по пингу):"
+        local cand idx=0 total=${#candidates[@]}
+        for cand in "${candidates[@]}"; do
+            idx=$((idx + 1))
+            local url host cport hp label
+            url="${cand#*$'\t'}"
+            printf '%s\n' "$url" >> "$tried_file"
+            hp="$(url_host_port "$url")" || { warn "  не разобрать URL, пропускаю"; continue; }
+            host="${hp% *}"; cport="${hp##* }"
+            [[ -n "$url" && -n "$host" && -n "$cport" ]] \
+                || { warn "  нет host:port у кандидата, пропускаю"; continue; }
+            if quarantine_blocked "$host" "$cport" ""; then
+                warn "  ${host}:${cport} в карантине, пропускаю"
                 continue
             fi
-            if [[ -n "$exit_ip" ]] && quarantine_blocked "" "" "$exit_ip"; then
-                warn "  exit IP $exit_ip в карантине, пропускаю"
-                kill "$XRAY_PID" 2>/dev/null || true
-                wait "$XRAY_PID" 2>/dev/null || true
-                continue
+            label=$(echo "$url" | sed -n 's|^.*#\([^"]*\)$|\1|p' | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip())[:50])" 2>/dev/null || echo "node-$idx-${host}")
+            if try_key "$url" "$host" "$cport" "$exclude_ip" "$label" "$idx" "$total"; then
+                return 0
             fi
-            # Проверяем доступность моделей opencode из текущего региона
-            if ! check_model_available; then
-                warn "  exit IP $exit_ip: модели заблокированы по региону — карантин 12 ч"
-                quarantine_add "$host" "$cport" "$exit_ip" "geo-block: модели не доступны из региона" 12
-                kill "$XRAY_PID" 2>/dev/null || true
-                wait "$XRAY_PID" 2>/dev/null || true
-                continue
-            fi
-            ACTIVE_LABEL="$label"
-            ACTIVE_HOST="$host"
-            ACTIVE_PORT="$cport"
-            ACTIVE_EXIT_IP="$exit_ip"
-            log "  РАБОТАЕТ! (HTTP $code, exit IP ${exit_ip:-?})"
-            return 0
-        else
-            warn "  Не работает (HTTP $code)"
-            kill "$XRAY_PID" 2>/dev/null || true
-            wait "$XRAY_PID" 2>/dev/null || true
-        fi
+        done
+        # батч не дал результата — берём следующий батч из оставшихся
     done
-
-    return 1
 }
 
 # Фиксирует активный ключ: маршруты + active.env для --rotate/--status/GUI

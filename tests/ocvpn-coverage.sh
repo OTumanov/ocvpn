@@ -124,6 +124,13 @@ OCVPN_OS="Linux"
 check "resolve linux" "5.6.7.8" "$(resolve_ipv4 stub)"
 OCVPN_OS="Darwin"
 
+echo "=== [E2] исключения хостов (deepseek/ollama — DIRECT) ==="
+# проверяем РЕАЛЬНЫЙ список (до тестов, которые его перезаписывают)
+check "нет deepseek" "0" "$(printf '%s\n' "${OPENCODE_DOMAINS[@]}" | grep -c 'deepseek' || true)"
+check "нет ollama" "0" "$(printf '%s\n' "${OPENCODE_DOMAINS[@]}" | grep -c 'ollama' || true)"
+check "есть opencode.ai" "1" "$(printf '%s\n' "${OPENCODE_DOMAINS[@]}" | grep -cx 'opencode.ai' || true)"
+check "есть openrouter.ai" "1" "$(printf '%s\n' "${OPENCODE_DOMAINS[@]}" | grep -cx 'openrouter.ai' || true)"
+
 echo "=== [D] resolve_domains ==="
 resolve_ipv4() { case "$1" in a) echo 1.1.1.1; echo 2.2.2.2;; b) echo 2.2.2.2;; esac; }
 OPENCODE_DOMAINS=("a" "b")
@@ -334,7 +341,7 @@ check "fetch пусто" 1 $?
 echo "=== [R] pick_working_key (успех/провал) ==="
 SUBS_FILE="$WORK/pick_subs.txt"
 printf 'vless://u1@10.0.0.1:443?security=none&type=tcp#One\n' > "$SUBS_FILE"
-select_candidates() { printf '5\t%s\n' "vless://u1@10.0.0.1:443?security=none&type=tcp#One"; }
+select_candidates() { local tf="${2:-}"; [[ -s "$tf" ]] && return 0; printf '5\t%s\n' "vless://u1@10.0.0.1:443?security=none&type=tcp#One"; }
 printf '#!/bin/bash\nexec /bin/sleep 12\n' > "$WORK/fake-xray2"; chmod +x "$WORK/fake-xray2"
 XRAY_BIN="$WORK/fake-xray2"
 curl() { echo 204; }
@@ -346,6 +353,7 @@ check "pick success" 0 $?
 check "pick выставил host" "10.0.0.1" "$ACTIVE_HOST"
 kill "$XRAY_PID" 2>/dev/null
 curl() { echo 000; }
+fetch_subscription() { return 1; }  # пул исчерпан — не уходим в сеть
 pick_working_key "" >/dev/null 2>&1
 check "pick fail" 1 $?
 
@@ -467,17 +475,21 @@ SUBS_FILE="$WORK/pick2.txt"
 printf 'vless://u@10.0.0.2:443?security=none&type=tcp#T\n' > "$SUBS_FILE"
 printf '#!/bin/bash\nexec /bin/sleep 12\n' > "$WORK/fake-xray2"; chmod +x "$WORK/fake-xray2"
 XRAY_BIN="$WORK/fake-xray2"
+fetch_subscription() { return 1; }   # при исчерпании пула — не уходим в сеть
+pick_cand() { local tf="${2:-}"; [[ -s "$tf" ]] && return 0; printf '5\t%s\n' "vless://u@10.0.0.2:443?security=none&type=tcp#T"; }
 select_candidates() { :; }
 curl() { echo 204; }
 current_exit_ip() { echo 10.0.0.2; }
 check_model_available() { return 0; }
 quarantine_blocked() { return 1; }
 quarantine_add() { :; }
+# fallback: пинг не ответил — берём из пула
 pick_working_key "" >/dev/null 2>&1; check "pick fallback" 0 $?
 kill "$XRAY_PID" 2>/dev/null
 SUBS_FILE="$WORK/pick3.txt"; printf 'not vless\n' > "$SUBS_FILE"
 pick_working_key "" >/dev/null 2>&1; check "pick нет кандидатов" 1 $?
-SUBS_FILE="$WORK/pick2.txt"; select_candidates() { printf '5\t%s\n' "vless://u@10.0.0.2:443?security=none&type=tcp#T"; }
+SUBS_FILE="$WORK/pick2.txt"
+select_candidates() { pick_cand "$@"; }
 quarantine_blocked() { return 0; }
 pick_working_key "" >/dev/null 2>&1; check "pick карантин host" 1 $?
 quarantine_blocked() { return 1; }
@@ -493,6 +505,22 @@ quarantine_blocked() { return 1; }
 check_model_available() { return 1; }
 pick_working_key "" >/dev/null 2>&1; check "pick geo-block" 1 $?
 kill "$XRAY_PID" 2>/dev/null
+
+# цикл: первый кандидат провалился — берёт следующий (исключая забракованный) и подключается
+SAVE_TRYK="$(declare -f try_key)"
+select_candidates() {
+    local tf="${2:-}"
+    if ! grep -q 'A' "$tf" 2>/dev/null; then printf '5\t%s\n' "vless://a@10.0.0.1:443?security=none&type=tcp#A"; return 0; fi
+    if ! grep -q 'B' "$tf" 2>/dev/null; then printf '5\t%s\n' "vless://b@10.0.0.2:443?security=none&type=tcp#B"; return 0; fi
+    return 0
+}
+try_key() { case "$1" in *b@*) ACTIVE_HOST=10.0.0.2; ACTIVE_LABEL=B; return 0 ;; *) return 1 ;; esac; }
+SUBS_FILE="$WORK/pick_loop.txt"
+printf 'vless://a@10.0.0.1:443?security=none&type=tcp#A\nvless://b@10.0.0.2:443?security=none&type=tcp#B\n' > "$SUBS_FILE"
+pick_working_key "" >/dev/null 2>&1
+check "pick перебирает батчи до успеха" 0 $?
+check "pick выбрал следующий ключ" "10.0.0.2" "$ACTIVE_HOST"
+eval "$SAVE_TRYK"
 
 # do_restart
 _spawn() { /bin/sleep 6 & printf 'HOLDER_PID=%s\nSTARTED=200\nACTIVE_EXIT_IP=2.2.2.2\n' "$!" > "$ACTIVE_FILE"; }
