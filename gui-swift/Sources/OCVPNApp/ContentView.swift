@@ -67,6 +67,40 @@ struct ContentView: View {
         ("~/Library/Logs/ocvpn-gui.log" as NSString).expandingTildeInPath
     static let socksPort = 10808
 
+    /// Версия из строки OCVPN_VERSION="x.y.z" в файле.
+    static func versionOf(_ path: String) -> String {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return ""
+        }
+        for line in text.split(separator: "\n") where line.hasPrefix("OCVPN_VERSION=") {
+            return line.replacingOccurrences(of: "OCVPN_VERSION=", with: "")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        }
+        return ""
+    }
+
+    /// Самоустановка бэкенда: если /usr/local/bin/ocvpn нет или он старее
+    /// встроенного в бандл — ставим из Resources через админ-диалог macOS.
+    static func ensureBackend() {
+        guard let res = Bundle.main.path(forResource: "ocvpn", ofType: "sh") else {
+            glog("backend: ресурс ocvpn.sh не найден в бандле")
+            return
+        }
+        let bundled = versionOf(res)
+        let installed = versionOf(backend)
+        if FileManager.default.isExecutableFile(atPath: backend),
+            !bundled.isEmpty, bundled == installed
+        {
+            return
+        }
+        glog("backend: устанавливаю (bundled=\(bundled) installed=\(installed))")
+        let cmd =
+            "mkdir -p /usr/local/bin && install -m 0755 '\(res)' '\(backend)'"
+            + " && '\(backend)' --cleanup"
+        let r = runAdmin(cmd)
+        glog("backend: install rc=\(r.ok) tail=\(r.out.suffix(160))")
+    }
+
     var body: some View {
         ZStack {
             Theme.background.ignoresSafeArea()
@@ -90,6 +124,11 @@ struct ContentView: View {
                 "start ver=\(ver) backend=\(Self.backend) subs=\(s.text)"
             )
             refreshSubs()
+            // бэкенд ставим/обновляем сами (может показать админ-диалог)
+            DispatchQueue.global(qos: .userInitiated).async {
+                ContentView.ensureBackend()
+                DispatchQueue.main.async { refreshSubs(); refreshAsync() }
+            }
             refreshAsync()
             timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
                 refreshAsync()

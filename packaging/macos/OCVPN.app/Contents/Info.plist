@@ -4,14 +4,12 @@
 <dict>
     <key>CFBundleName</key>
     <string>OCVPN</string>
-    <key>CFBundleDisplayName</key>
-    <string>OCVPN</string>
     <key>CFBundleIdentifier</key>
-    <string>ai.opencode.ocvpn</string>
+    <string>ai.opencode.ocvpn.native</string>
     <key>CFBundleVersion</key>
-    <string>1.5.0</string>
+    <string>1.5.1</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.5.0</string>
+    <string>1.5.1</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
