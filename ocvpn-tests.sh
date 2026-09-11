@@ -221,6 +221,7 @@ else
 fi
 
 # Стабы Darwin-утилит (НЕ в /tmp: он бывает noexec — стабы бы не запустились)
+mkdir -p "${HOME}/.cache"
 STUBROOT="$(mktemp -d "${HOME}/.cache/ovpn-tests-XXXXXX")"
 STUB="$STUBROOT/darwin-stub"
 mkdir -p "$STUB"
@@ -373,6 +374,7 @@ fi
 
 # Trap-регрессия: read-only режимы не делают ЗАПИСЕЙ в iptables и не трогают hosts
 # (стаб — НЕ в /tmp: там noexec)
+mkdir -p "${HOME}/.cache"
 TRAPROOT="$(mktemp -d "${HOME}/.cache/ovpn-traptest-XXXXXX")"
 TRAPSTUB="$TRAPROOT/stub"
 mkdir -p "$TRAPSTUB"

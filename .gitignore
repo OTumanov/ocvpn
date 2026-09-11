@@ -1,0 +1,3 @@
+gui-swift/.build/
+dist/
+*.tmp

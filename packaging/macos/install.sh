@@ -26,26 +26,33 @@ install -m 0644 "$REPO/gui/ocvpn-gui.py" /usr/local/lib/ocvpn/ocvpn-gui.py
 # Остановить старый python-GUI (если висит — именно он ел память на Tk 8.5)
 pkill -f ocvpn-gui.py 2>/dev/null || true
 
-# GUI: сначала нативный Swift (сборка на маке, ~1 мин), иначе запасной python.
-# Версию берём из ocvpn.sh, чтобы не разъезжалась.
+# GUI: сначала готовый нативный Swift из архива (без локальной сборки),
+# иначе — сборка на маке (нужен Swift), иначе — запасной python-GUI.
 APP_VER="$(grep -m1 -o 'OCVPN_VERSION="[0-9.]*"' "$REPO/ocvpn.sh" | cut -d'"' -f2)"
-APP_VER="${APP_VER:-1.4.0}"
+APP_VER="${APP_VER:-1.5.0}"
 APP_OK=0
-if command -v swift >/dev/null 2>&1; then
+APP_BIN="$SRC/OCVPN.app/Contents/MacOS/OCVPN"
+HOST_ARCH="$(uname -m)"
+if [[ -f "$APP_BIN" ]] && file "$APP_BIN" 2>/dev/null | grep -q 'Mach-O' \
+    && file "$APP_BIN" 2>/dev/null | grep -q "$HOST_ARCH"; then
+    rm -rf /Applications/OCVPN.app
+    cp -R "$SRC/OCVPN.app" /Applications/OCVPN.app
+    chmod +x /Applications/OCVPN.app/Contents/MacOS/OCVPN
+    APP_OK=1
+    echo "Нативный GUI установлен из архива (без сборки)."
+elif command -v swift >/dev/null 2>&1; then
     echo "Собираю нативный Swift-GUI $APP_VER (около минуты)…"
     if bash "$REPO/gui-swift/build-app.sh" "$APP_VER" /Applications/OCVPN.app 2>/tmp/ocvpn-swift-build.log; then
         APP_OK=1
         echo "Нативный GUI собран: /Applications/OCVPN.app"
     else
-        echo "ВНИМАНИЕ: Swift-сборка не удалась (лог /tmp/ocvpn-swift-build.log) — ставлю запасной python-GUI." >&2
+        echo "ВНИМАНИЕ: Swift-сборка не удалась (лог /tmp/ocvpn-swift-build.log)." >&2
     fi
 else
-    echo "ВНИМАНИЕ: нет swift (нужен Xcode CLT: xcode-select --install) — ставлю запасной python-GUI." >&2
+    echo "ВНИМАНИЕ: нет готового GUI под $HOST_ARCH и нет swift (xcode-select --install)." >&2
 fi
 if [[ "$APP_OK" == "0" ]]; then
-    rm -rf /Applications/OCVPN.app
-    cp -R "$SRC/OCVPN.app" /Applications/OCVPN.app
-    chmod +x /Applications/OCVPN.app/Contents/MacOS/OCVPN
+    echo "ВНИМАНИЕ: GUI не установлен — останется только CLI (ocvpn)." >&2
 fi
 # Снять карантин с архива из сети + ad-hoc подпись, иначе первый запуск упрётся в Gatekeeper
 xattr -dr com.apple.quarantine /Applications/OCVPN.app 2>/dev/null || true

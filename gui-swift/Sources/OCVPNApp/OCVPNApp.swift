@@ -2,8 +2,9 @@ import SwiftUI
 import AppKit
 
 class AppDelegate: NSObject, NSApplicationDelegate {
+    // Окно можно закрыть — приложение остаётся жить в строке меню.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
     }
 }
 
@@ -12,10 +13,15 @@ struct OCVPNApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
 
     var body: some Scene {
-        WindowGroup("OCVPN") {
+        Window("OCVPN", id: "main") {
             ContentView()
-                .frame(minWidth: 540, minHeight: 560)
+                .frame(minWidth: 560, minHeight: 740)
         }
-        .windowResizability(.contentSize)
+        .defaultSize(width: 620, height: 840)
+        .windowResizability(.contentMinSize)
+
+        MenuBarExtra("OCVPN", systemImage: "shield.lefthalf.filled") {
+            MenuBarView()
+        }
     }
 }

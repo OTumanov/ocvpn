@@ -5,10 +5,34 @@ set -euo pipefail
 # (в частности под sudo/systemd с урезанным PATH). Добавляем, не затирая остальное.
 export PATH="/usr/sbin:/sbin:$PATH"
 
-OCVPN_VERSION="1.4.0"
+OCVPN_VERSION="1.5.0"
 # Linux (iptables REDIRECT) или macOS (pf rdr). Определяем один раз.
 OCVPN_OS="$(uname -s 2>/dev/null || echo Linux)"
 is_macos() { [[ "$OCVPN_OS" == "Darwin" ]]; }
+
+# setsid есть не везде (в macOS его нет) — отрываем по-портативному.
+# Неинтерактивный шелл при выходе не шлёт SIGHUP фоновым детям (они
+# переусыновляются launchd), поэтому nohup не нужен — под osascript он
+# только сыпет «can't detach from console».
+_spawn() {
+    local logf="$1"; shift
+    mkdir -p "$(dirname "$logf")"
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$@" </dev/null >>"$logf" 2>&1 &
+    else
+        "$@" </dev/null >>"$logf" 2>&1 &
+    fi
+}
+
+# shuf — GNU coreutils, в macOS его нет. sort -R есть и в BSD, и в GNU.
+shuffle() {
+    if sort -R </dev/null >/dev/null 2>&1; then
+        sort -R
+    else
+        awk -v seed="$$$(date +%s)" 'BEGIN{srand(seed)} {print rand()"\t"$0}' \
+            | sort -n | cut -f2-
+    fi
+}
 
 # === Config ===
 # Приоритет подписки: $OCVPN_SUBS_URL (env) > ~/.ocvpn-subs-url (файл пользователя)
@@ -22,6 +46,9 @@ if [[ -z "$SUBS_URL" && -s /etc/ocvpn/subs-url ]]; then
     SUBS_URL="$(head -n1 /etc/ocvpn/subs-url 2>/dev/null | tr -d '[:space:]')"
 fi
 SUBS_URL="${SUBS_URL:-$SUBS_FALLBACK_URL}"
+# Схемы, которые умеет наш конвертер в xray-outbound.
+# hysteria2 не поддерживаем: это протокол sing-box, в Xray-core его нет.
+SUPPORTED_RE='^(vless|vmess|trojan|ss|http|https|socks|socks5|socks5h)://'
 SOCKS_PORT=10808
 HTTP_PORT=10809
 REDIRECT_PORT=12345
@@ -63,7 +90,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 log()  { echo -e "${GREEN}[+]${NC} $*"; }
-warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*" >&2; }
 err()  { echo -e "${RED}[-]${NC} $*" >&2; }
 
 cleanup() {
@@ -86,6 +113,39 @@ trap cleanup EXIT
 # Без этого --help/--version/--status/--watch/--rotate сносили бы живые
 # маршруты чужого запущенного ocvpn при своём завершении.
 no_cleanup() { trap - EXIT; }
+
+# Убить процессы по маске, кроме себя (pgrep не находит сам себя, но
+# на всякий случай исключаем $$).
+_kill_matching() {
+    local pat="$1" pid
+    while IFS= read -r pid; do
+        [[ -z "$pid" || "$pid" == "$$" ]] && continue
+        kill "$pid" 2>/dev/null || true
+    done < <(pgrep -f "$pat" 2>/dev/null || true)
+}
+
+# Полная остановка: держатели, xray, вотчдоги + файлы состояния.
+# Нужна для --cleanup и чтобы не плодить дубли при повторном запуске.
+stop_all() {
+    local hpid xpid
+    if [[ -f "$ACTIVE_FILE" ]]; then
+        hpid="$(grep -E '^HOLDER_PID=' "$ACTIVE_FILE" 2>/dev/null | cut -d= -f2)"
+        xpid="$(grep -E '^XRAY_PID=' "$ACTIVE_FILE" 2>/dev/null | cut -d= -f2)"
+        [[ -n "$hpid" ]] && kill "$hpid" 2>/dev/null || true
+        [[ -n "$xpid" ]] && kill "$xpid" 2>/dev/null || true
+    fi
+    if [[ -f "$WATCH_PIDFILE" ]]; then
+        kill "$(cat "$WATCH_PIDFILE" 2>/dev/null)" 2>/dev/null || true
+    fi
+    _kill_matching 'xray run -c /tmp/opencode-vpn'
+    _kill_matching 'ocvpn --watch'
+    _kill_matching 'ocvpn(\.sh)?$'
+    sleep 1
+    _kill_matching 'xray run -c /tmp/opencode-vpn'
+    _kill_matching 'ocvpn(\.sh)?$'
+    rm -f "$ACTIVE_FILE" "$WATCH_PIDFILE" "$LAST_ROTATE_FILE" \
+        "$REASON_FILE" "$ROTATE_HOUR_FILE" 2>/dev/null || true
+}
 
 # === Resolve IPv4 одного домена (Linux: getent, macOS: dscacheutil/dig/python) ===
 resolve_ipv4() {
@@ -141,19 +201,16 @@ hosts_setup() {
     # убрать старый блок
     sed "/^[^#]*$HOSTS_MARK\$/d" /etc/hosts > "$tmp" 2>/dev/null || cp /etc/hosts "$tmp"
     # собрать IPv4-адреса доменов
-    local ip d key
-    declare -A seen
-    for d in "${OPENCODE_DOMAINS[@]}"; do
-        while IFS= read -r ip; do
-            [[ -z "$ip" ]] && continue
-            # дедуп по паре domain+ip: один и тот же IP может обслуживать
-            # несколько доменов, и каждый должен получить IPv4-запись
-            key="$d|$ip"
-            [[ -n "${seen[$key]+x}" ]] && continue
-            seen["$key"]=1
-            printf '%-15s %s %s\n' "$ip" "$d" "$HOSTS_MARK" >> "$tmp"
-        done < <(resolve_ipv4 "$d")
-    done
+    local ip d
+    # дедуп по строке через awk (ассоц. массивов нет в bash 3.2 из macOS)
+    {
+        for d in "${OPENCODE_DOMAINS[@]}"; do
+            while IFS= read -r ip; do
+                [[ -z "$ip" ]] && continue
+                printf '%-15s %s %s\n' "$ip" "$d" "$HOSTS_MARK"
+            done < <(resolve_ipv4 "$d")
+        done
+    } | awk '!seen[$0]++' >> "$tmp"
     # записать только если есть добавленные строки с маркером
     if grep -q -- "$HOSTS_MARK" "$tmp"; then
         cp "$tmp" /etc/hosts
@@ -231,17 +288,16 @@ setup_routes_linux() {
 # Локальный трафик на macOS проходит через lo0, поэтому rdr вешаем туда.
 # Приватные подсети исключать не нужно: rdr ловит только IP из таблицы целей.
 pf_anchor_content() {
-    local ip
-    {
-        echo "table <ocvpn_targets> persist {"
-        while IFS= read -r ip; do
-            [[ -z "$ip" ]] && continue
-            echo "  $ip"
-        done < <(resolve_domains)
-        echo "}"
-        echo "rdr pass on lo0 proto tcp from any to <ocvpn_targets> port 443 -> 127.0.0.1 port $REDIRECT_PORT"
-        echo "pass out route-to (lo0 127.0.0.1) proto tcp from any to <ocvpn_targets> port 443 keep state"
-    }
+    # ВАЖНО: pf не принимает переносы строк внутри inline-таблицы —
+    # все адреса должны быть в одной строке через запятую.
+    local ip list=""
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        if [[ -z "$list" ]]; then list="$ip"; else list="$list, $ip"; fi
+    done < <(resolve_domains | sort -u)
+    echo "table <ocvpn_targets> persist { $list }"
+    echo "rdr pass on lo0 proto tcp from any to <ocvpn_targets> port 443 -> 127.0.0.1 port $REDIRECT_PORT"
+    echo "pass out route-to (lo0 127.0.0.1) proto tcp from any to <ocvpn_targets> port 443 keep state"
 }
 
 pf_ensure_refs() {
@@ -252,12 +308,28 @@ pf_ensure_refs() {
     if [[ ! -f "${PF_CONF}.ocvpn-bak" ]]; then
         cp "$PF_CONF" "${PF_CONF}.ocvpn-bak"
     fi
-    {
-        echo ""
-        echo "rdr-anchor \"$PF_ANCHOR\" $PF_MARK"
-        echo "anchor \"$PF_ANCHOR\" $PF_MARK"
-        echo "load anchor \"$PF_ANCHOR\" from \"$PF_ANCHOR_FILE\" $PF_MARK"
-    } >> "$PF_CONF"
+    local tmp
+    tmp="$(mktemp /tmp/ocvpn-pfconf.XXXXXX)"
+    # Порядок в pf.conf обязателен: translation (rdr-anchor) ДО filtering (anchor).
+    # rdr-anchor вставляем после последней существующей rdr-anchor-строки,
+    # а anchor/load anchor добавляем в конец (filtering).
+    awk -v mark="$PF_MARK" -v anchor="$PF_ANCHOR" -v file="$PF_ANCHOR_FILE" '
+        { buf[NR] = $0 }
+        /^[[:space:]]*rdr-anchor/ { last = NR }
+        /^[[:space:]]*anchor/ && first_anchor == 0 { first_anchor = NR }
+        END {
+            if (last == 0) last = first_anchor - 1
+            for (i = 1; i <= NR; i++) {
+                print buf[i]
+                if (i == last) printf "rdr-anchor \"%s\" %s\n", anchor, mark
+            }
+            if (last <= 0) printf "rdr-anchor \"%s\" %s\n", anchor, mark
+            printf "anchor \"%s\" %s\n", anchor, mark
+            printf "load anchor \"%s\" from \"%s\" %s\n", anchor, file, mark
+        }
+    ' "$PF_CONF" > "$tmp"
+    cp "$tmp" "$PF_CONF"
+    rm -f "$tmp"
 }
 
 pf_remove_refs() {
@@ -285,8 +357,11 @@ setup_routes_darwin() {
     pf_anchor_content > "$PF_ANCHOR_FILE"
     pf_ensure_refs
     # Включаем pf, если выключен (иначе rdr не работает)
-    pfctl -e 2>/dev/null || true
-    pfctl -f "$PF_CONF" 2>/dev/null || { err "pfctl -f $PF_CONF не сработал"; exit 1; }
+    pfctl -e 2>&1 | grep -v 'already enabled' || true
+    if ! pfctl -f "$PF_CONF"; then
+        err "pfctl -f $PF_CONF не сработал (см. ошибку выше)"
+        exit 1
+    fi
     log "Маршрутизация активна (pf): $n IP/доменов opencode → через VPN"
 }
 
@@ -326,7 +401,7 @@ find_xray() {
         asset_os="macos"
         case "$arch" in
             x86_64)        arch="64" ;;
-            arm64|aarch64) arch="arm64" ;;
+            arm64|aarch64) arch="arm64-v8a" ;;
             *)
                 err "Неподдерживаемая архитектура: $arch"
                 exit 1
@@ -417,6 +492,56 @@ xhttp_stream_settings() {
         "path": "%s",
         "host": "%s"%s
     }' "$path" "$sni" "$mode_json"
+}
+
+# Общий каркас конфига xray: inbounds (socks/http/transparent) + routing.
+# $1 — готовый JSON outbound'а "proxy" (свой для каждого протокола), $2 — каталог.
+emit_xray_config() {
+    local proxy_json="$1" tmp="$2"
+    cat > "$tmp/config.json" <<XRAY_EOF
+{
+    "log": { "loglevel": "warning" },
+    "inbounds": [
+        {
+            "tag": "socks",
+            "port": $SOCKS_PORT,
+            "listen": "127.0.0.1",
+            "protocol": "socks",
+            "settings": { "auth": "noauth", "udp": true }
+        },
+        {
+            "tag": "http",
+            "port": $HTTP_PORT,
+            "listen": "127.0.0.1",
+            "protocol": "http"
+        },
+        {
+            "tag": "transparent",
+            "port": $REDIRECT_PORT,
+            "listen": "0.0.0.0",
+            "protocol": "dokodemo-door",
+            "settings": {
+                "network": "tcp",
+                "followRedirect": true
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls"]
+            }
+        }
+    ],
+    "outbounds": [
+        $proxy_json,
+        { "tag": "direct", "protocol": "freedom" }
+    ],
+    "routing": {
+        "domainStrategy": "AsIs",
+        "rules": [
+            { "type": "field", "outboundTag": "direct", "ip": ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "::1/128", "fc00::/7", "fe80::/10"] }
+        ]
+    }
+}
+XRAY_EOF
 }
 
 vless_to_xray() {
@@ -525,41 +650,9 @@ NONE_EOF
     local flow_str=""
     [[ -n "$flow" ]] && flow_str="\"flow\": \"$flow\","
 
-    # Write full xray config
-    cat > "$tmp/config.json" <<XRAY_EOF
+    local proxy_json
+    proxy_json=$(cat <<PROXY_EOF
 {
-    "log": { "loglevel": "warning" },
-    "inbounds": [
-        {
-            "tag": "socks",
-            "port": $SOCKS_PORT,
-            "listen": "127.0.0.1",
-            "protocol": "socks",
-            "settings": { "auth": "noauth", "udp": true }
-        },
-        {
-            "tag": "http",
-            "port": $HTTP_PORT,
-            "listen": "127.0.0.1",
-            "protocol": "http"
-        },
-        {
-            "tag": "transparent",
-            "port": $REDIRECT_PORT,
-            "listen": "0.0.0.0",
-            "protocol": "dokodemo-door",
-            "settings": {
-                "network": "tcp",
-                "followRedirect": true
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls"]
-            }
-        }
-    ],
-    "outbounds": [
-        {
             "tag": "proxy",
             "protocol": "vless",
             "settings": {
@@ -571,100 +664,549 @@ NONE_EOF
                 "level": 0
             },
             "streamSettings": $stream_settings
-        },
-        { "tag": "direct", "protocol": "freedom" }
-    ],
-    "routing": {
-        "domainStrategy": "AsIs",
-        "rules": [
-            { "type": "field", "outboundTag": "direct", "ip": ["geoip:private"] }
-        ]
-    }
+        }
+PROXY_EOF
+)
+    emit_xray_config "$proxy_json" "$tmp"
 }
-XRAY_EOF
+
+# === vmess:// (base64 JSON) -> xray ===
+vmess_to_xray() {
+    local url="$1" tmp="$2"
+    local b64="${url#vmess://}"
+    b64="${b64%%#*}"
+    local kv
+    kv=$(printf '%s' "$b64" | python3 -c '
+import sys, base64, json, shlex
+raw = sys.stdin.read().strip()
+raw += "=" * (-len(raw) % 4)
+try:
+    d = json.loads(base64.b64decode(raw).decode("utf-8", "replace"))
+except Exception:
+    sys.exit(1)
+def g(k, default=""):
+    v = d.get(k, default)
+    return "" if v is None else str(v)
+out = {
+    "host": g("add"), "port": g("port"), "uuid": g("id"),
+    "aid": g("aid", "0"), "scy": g("scy", "auto"),
+    "net": g("net", "tcp"), "tls": g("tls", ""), "sni": g("sni"),
+    "wshost": g("host"), "path": g("path", "/"), "type": g("type", "none"),
+    "service": g("path") if g("net") == "grpc" else g("serviceName"),
+    "alpn": g("alpn"),
+}
+for k, v in out.items():
+    print(f"{k}={shlex.quote(v)}")
+' 2>/dev/null) || { warn "vmess: не удалось распарсить"; return 1; }
+    [[ -n "$kv" ]] || { warn "vmess: пустой конфиг"; return 1; }
+    eval "$kv"
+    [[ -n "$host" && -n "$port" && -n "$uuid" ]] || { warn "vmess: нет host/port/id"; return 1; }
+
+    local type="${net:-tcp}"
+    [[ "$type" == "h2" ]] && type="tcp"
+    local security="none"
+    [[ "$tls" == "tls" || "$tls" == "reality" ]] && security="tls"
+    [[ -z "$sni" ]] && sni="${wshost:-$host}"
+
+    local stream_settings
+    if [[ "$security" == "tls" ]]; then
+        stream_settings=$(cat <<VMESS_TLS
+{
+    "network": "$type",
+    "security": "tls",
+    "tlsSettings": {
+        "serverName": "$sni",
+        "allowInsecure": false
+    }$(ws_stream_settings "$type" "$path" "${wshost:-$sni}")
+    $(xhttp_stream_settings "$type" "$path" "${wshost:-$sni}" "")
+    $(grpc_stream_settings "$type" "$service")
+}
+VMESS_TLS
+)
+    else
+        stream_settings=$(cat <<VMESS_NONE
+{
+    "network": "$type"$(ws_stream_settings "$type" "$path" "${wshost:-$sni}")
+    $(xhttp_stream_settings "$type" "$path" "${wshost:-$sni}" "")
+    $(grpc_stream_settings "$type" "$service")
+}
+VMESS_NONE
+)
+    fi
+
+    local proxy_json
+    proxy_json=$(cat <<PROXY_EOF
+{
+            "tag": "proxy",
+            "protocol": "vmess",
+            "settings": {
+                "address": "$host",
+                "port": $port,
+                "id": "$uuid",
+                "alterId": ${aid:-0},
+                "security": "${scy:-auto}",
+                "level": 0
+            },
+            "streamSettings": $stream_settings
+        }
+PROXY_EOF
+)
+    emit_xray_config "$proxy_json" "$tmp"
+}
+
+# === trojan:// -> xray ===
+trojan_to_xray() {
+    local url="$1" tmp="$2"
+    local pass host port params
+    pass=$(printf '%s' "$url" | sed -n 's|^trojan://\([^@]*\)@.*|\1|p')
+    host=$(printf '%s' "$url" | sed -n 's|^trojan://[^@]*@\([^:]*\):.*|\1|p')
+    port=$(printf '%s' "$url" | sed -n 's|^trojan://[^@]*@[^:]*:\([0-9]*\).*|\1|p')
+    params=$(printf '%s' "$url" | sed -n 's|^trojan://[^?]*?\([^#]*\).*|\1|p')
+    pass=$(printf '%s' "$pass" | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null || printf '%s' "$pass")
+    [[ -n "$host" && -n "$port" && -n "$pass" ]] || { warn "trojan: битый URL"; return 1; }
+
+    local security="tls" sni="" fp="" alpn="" type="tcp" path="" host_param="" serviceName=""
+    local p key val
+    IFS='&' read -ra PARAM_ARR <<< "$params"
+    for p in "${PARAM_ARR[@]}"; do
+        key="${p%%=*}"; val="${p#*=}"
+        case "$key" in
+            security) security="$val" ;;
+            sni) sni="$val" ;;
+            fp) fp="$val" ;;
+            alpn) alpn="$val" ;;
+            type) type="$val" ;;
+            path) path="$val" ;;
+            host) host_param="$val" ;;
+            serviceName) serviceName="$val" ;;
+        esac
+    done
+    for v in path sni host_param serviceName; do
+        local decoded
+        decoded=$(printf '%s' "${!v}" | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read()))" 2>/dev/null || printf '%s' "${!v}")
+        eval "$v=\$decoded"
+    done
+    [[ "$type" == "raw" ]] && type="tcp"
+    [[ -z "$sni" ]] && sni="${host_param:-$host}"
+
+    local alpn_json=""
+    if [[ -n "$alpn" ]]; then
+        alpn_json=$(printf '%s' "$alpn" | python3 -c "import sys
+raw=sys.stdin.read().strip()
+vals=[a.strip() for a in raw.split(',') if a.strip()]
+print('\"alpn\": ['+','.join('\"'+a+'\"' for a in vals)+']')" 2>/dev/null || echo "")
+    fi
+
+    local stream_settings
+    if [[ "$security" == "tls" ]]; then
+        stream_settings=$(cat <<TROJAN_TLS
+{
+    "network": "$type",
+    "security": "tls",
+    "tlsSettings": {
+        "serverName": "$sni",
+        "allowInsecure": false$(if [[ -n "$alpn_json" ]]; then echo ",
+        $alpn_json"; fi)
+    }$(ws_stream_settings "$type" "$path" "$sni")
+    $(xhttp_stream_settings "$type" "$path" "$sni" "")
+    $(grpc_stream_settings "$type" "$serviceName")
+}
+TROJAN_TLS
+)
+    else
+        stream_settings=$(cat <<TROJAN_NONE
+{
+    "network": "$type"$(ws_stream_settings "$type" "$path" "$sni")
+    $(xhttp_stream_settings "$type" "$path" "$sni" "")
+    $(grpc_stream_settings "$type" "$serviceName")
+}
+TROJAN_NONE
+)
+    fi
+
+    local proxy_json
+    proxy_json=$(cat <<PROXY_EOF
+{
+            "tag": "proxy",
+            "protocol": "trojan",
+            "settings": {
+                "servers": [
+                    { "address": "$host", "port": $port, "password": "$pass" }
+                ]
+            },
+            "streamSettings": $stream_settings
+        }
+PROXY_EOF
+)
+    emit_xray_config "$proxy_json" "$tmp"
+}
+
+# === ss:// (Shadowsocks, SIP002 и legacy) -> xray ===
+ss_to_xray() {
+    local url="$1" tmp="$2"
+    local body="${url#ss://}"
+    body="${body%%#*}"
+    case "$body" in *\?*) body="${body%%\?*}" ;; esac
+
+    local method="" password="" host="" port="" userinfo=""
+    if [[ "$body" == *"@"* ]]; then
+        userinfo="${body%@*}"
+        host="${body##*@}"; host="${host%%/*}"
+        # userinfo: base64(method:pass) либо method:pass (url-encoded)
+        local dec
+        dec=$(printf '%s' "$userinfo" | python3 -c "import sys,base64
+s=sys.stdin.read().strip(); s+='='*(-len(s)%4)
+try: print(base64.b64decode(s).decode('utf-8','replace'))
+except Exception: sys.exit(1)" 2>/dev/null)
+        if [[ -n "$dec" && "$dec" == *:* ]]; then
+            userinfo="$dec"
+        else
+            userinfo=$(printf '%s' "$userinfo" | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
+        fi
+    else
+        local dec
+        dec=$(printf '%s' "$body" | python3 -c "import sys,base64
+s=sys.stdin.read().strip(); s+='='*(-len(s)%4)
+print(base64.b64decode(s).decode('utf-8','replace'))" 2>/dev/null) || { warn "ss: не удалось декодировать"; return 1; }
+        userinfo="${dec%@*}"; host="${dec##*@}"
+    fi
+    method="${userinfo%%:*}"; password="${userinfo#*:}"
+    port="${host##*:}"; host="${host%:*}"
+    [[ -n "$host" && -n "$port" && -n "$method" && -n "$password" ]] \
+        || { warn "ss: битый URL"; return 1; }
+
+    local proxy_json
+    proxy_json=$(cat <<PROXY_EOF
+{
+            "tag": "proxy",
+            "protocol": "shadowsocks",
+            "settings": {
+                "servers": [
+                    { "address": "$host", "port": $port, "method": "$method", "password": "$password" }
+                ]
+            },
+            "streamSettings": { "network": "tcp" }
+        }
+PROXY_EOF
+)
+    emit_xray_config "$proxy_json" "$tmp"
+}
+
+# === http:// / https:// (HTTP(S)-прокси) -> xray ===
+http_to_xray() {
+    local url="$1" tmp="$2"
+    local scheme="${url%%://*}"
+    local rest="${url#*://}"; rest="${rest%%#*}"
+    local userinfo="" hostport
+    if [[ "$rest" == *"@"* ]]; then
+        userinfo="${rest%@*}"; hostport="${rest##*@}"
+    else
+        hostport="$rest"
+    fi
+    hostport="${hostport%%[/?]*}"
+    [[ "$hostport" == *:* ]] || { warn "http: нет порта"; return 1; }
+    local host="${hostport%:*}" port="${hostport##*:}"
+    local user="" pass=""
+    if [[ -n "$userinfo" ]]; then
+        user=$(printf '%s' "${userinfo%%:*}" | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null || printf '%s' "${userinfo%%:*}")
+        if [[ "$userinfo" == *:* ]]; then
+            pass=$(printf '%s' "${userinfo#*:}" | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null || printf '%s' "${userinfo#*:}")
+        fi
+    fi
+    local users_json=""
+    if [[ -n "$user" ]]; then
+        users_json=",
+                    \"users\": [ { \"user\": \"$user\", \"pass\": \"$pass\" } ]"
+    fi
+    local stream_settings='{ "network": "tcp" }'
+    [[ "$scheme" == "https" ]] && stream_settings=$(cat <<HTTP_TLS
+{
+    "network": "tcp",
+    "security": "tls",
+    "tlsSettings": { "serverName": "$host", "allowInsecure": false }
+}
+HTTP_TLS
+)
+
+    local proxy_json
+    proxy_json=$(cat <<PROXY_EOF
+{
+            "tag": "proxy",
+            "protocol": "http",
+            "settings": {
+                "servers": [
+                    { "address": "$host", "port": $port$users_json }
+                ]
+            },
+            "streamSettings": $stream_settings
+        }
+PROXY_EOF
+)
+    emit_xray_config "$proxy_json" "$tmp"
+}
+
+# === socks:// socks5:// socks5h:// (SOCKS5-прокси) -> xray ===
+# SOCKS4 в Xray-outbound нет — такие ключи пропускаем (is_supported_key вернёт 1).
+socks_to_xray() {
+    local url="$1" tmp="$2"
+    local rest="${url#*://}"; rest="${rest%%#*}"
+    local userinfo="" hostport
+    if [[ "$rest" == *"@"* ]]; then
+        userinfo="${rest%@*}"; hostport="${rest##*@}"
+    else
+        hostport="$rest"
+    fi
+    hostport="${hostport%%[/?]*}"
+    [[ "$hostport" == *:* ]] || { warn "socks: нет порта"; return 1; }
+    local host="${hostport%:*}" port="${hostport##*:}"
+    local user="" pass=""
+    if [[ -n "$userinfo" ]]; then
+        user=$(printf '%s' "${userinfo%%:*}" | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null || printf '%s' "${userinfo%%:*}")
+        [[ "$userinfo" == *:* ]] && pass=$(printf '%s' "${userinfo#*:}" | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null || printf '%s' "${userinfo#*:}")
+    fi
+    local users_json=""
+    if [[ -n "$user" ]]; then
+        users_json=",
+                    \"users\": [ { \"user\": \"$user\", \"pass\": \"$pass\" } ]"
+    fi
+
+    local proxy_json
+    proxy_json=$(cat <<PROXY_EOF
+{
+            "tag": "proxy",
+            "protocol": "socks",
+            "settings": {
+                "servers": [
+                    { "address": "$host", "port": $port$users_json }
+                ]
+            },
+            "streamSettings": { "network": "tcp" }
+        }
+PROXY_EOF
+)
+    emit_xray_config "$proxy_json" "$tmp"
+}
+
+# === Диспетчер по схеме URL ===
+uri_to_xray() {
+    case "$1" in
+        vless://*)   vless_to_xray "$@" ;;
+        vmess://*)   vmess_to_xray "$@" ;;
+        trojan://*)  trojan_to_xray "$@" ;;
+        ss://*)      ss_to_xray "$@" ;;
+        http://*|https://*) http_to_xray "$@" ;;
+        socks://*|socks5://*|socks5h://*) socks_to_xray "$@" ;;
+        *) warn "Неподдерживаемый протокол: ${1%%://*}://"; return 1 ;;
+    esac
 }
 
 # === TCP-пинг до VLESS-сервера (быстрая проверка живости) ===
 # Вывод: latency_ms host port
 ping_host() {
     local host="$1" port="$2"
-    local start end ms
-    start=$(date +%s%N 2>/dev/null || echo 0)
-    if timeout "${PING_TIMEOUT}" bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
-        end=$(date +%s%N 2>/dev/null || echo 0)
-        if [[ $start != 0 && $end != 0 ]]; then
-            ms=$(( (end - start) / 1000000 ))
-        else
-            ms=0
-        fi
-        echo "$ms $host $port"
-    else
-        echo "99999 $host $port"
-    fi
+    # timeout/gtimeout в macOS нет, а date +%s%N поддерживается не везде —
+    # TCP-пробу и замер делаем через python3 (он и так обязателен для скрипта).
+    python3 - "$host" "$port" "$PING_TIMEOUT" <<'PY' 2>/dev/null || echo "99999 $host $port"
+import socket, sys, time
+host, port, secs = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(secs)
+t0 = time.time()
+try:
+    s.connect((host, port))
+except Exception:
+    sys.exit(1)
+s.close()
+print(int((time.time() - t0) * 1000), host, port)
+PY
 }
 
-# === Отбор 10 случайных ключей по короткому TCP-пингу ===
-# Выбираем только vless-ключи тех типов, что умеет vless_to_xray.
+# === Универсальный разбор host:port для vless/vmess/trojan/ss ===
+url_host_port() {
+    local url="$1"
+    local scheme="${url%%://*}" body hostport dec hp
+    case "$scheme" in
+        vless|trojan|http|https|socks|socks5|socks5h)
+            hostport="${url##*@}"; hostport="${hostport%%[/?#]*}"
+            ;;
+        ss)
+            body="${url#ss://}"; body="${body%%#*}"; body="${body%%\?*}"
+            if [[ "$body" == *"@"* ]]; then
+                hostport="${body##*@}"; hostport="${hostport%%/*}"
+            else
+                dec=$(printf '%s' "$body" | python3 -c "import sys,base64
+s=sys.stdin.read().strip(); s+='='*(-len(s)%4)
+print(base64.b64decode(s).decode('utf-8','replace'))" 2>/dev/null) || return 1
+                hostport="${dec##*@}"
+            fi
+            ;;
+        vmess)
+            body="${url#vmess://}"; body="${body%%#*}"
+            hp=$(printf '%s' "$body" | python3 -c "import sys,base64,json
+s=sys.stdin.read().strip(); s+='='*(-len(s)%4)
+d=json.loads(base64.b64decode(s).decode('utf-8','replace'))
+print(str(d.get('add',''))+' '+str(d.get('port','')))" 2>/dev/null) || return 1
+            printf '%s' "$hp"
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+    [[ "$hostport" == *:* ]] || return 1
+    printf '%s %s' "${hostport%:*}" "${hostport##*:}"
+}
+
+# === Отбор N случайных ключей по короткому TCP-пингу ===
+# Вывод: "<latency>\t<url>" (устойчиво к пробелам в URL/названии).
 select_candidates() {
     local subs_file="$1"
     local poolfile="$TMPDIR/pool.txt"
-    mapfile -t pool < <(grep -E '^vless://' "$subs_file" | while IFS= read -r u; do
+    # mapfile нет в bash 3.2 (macOS) — читаем строки в массив портируемо.
+    local pool=()
+    while IFS= read -r u; do
+        pool+=("$u")
+    done < <(grep -E "$SUPPORTED_RE" "$subs_file" | while IFS= read -r u; do
         is_supported_key "$u" && echo "$u"
-    done | shuf -n "${BATCH_SIZE}" 2>/dev/null)
+    done | shuffle | head -n "${BATCH_SIZE}")
     printf '%s\n' "${pool[@]:-}" > "$poolfile" 2>/dev/null || true
 
-    # Параллельный пинг всех 10
+    # Параллельный пинг всех N
     log "Пингую ${BATCH_SIZE} случайных серверов..." >&2
     local results="$TMPDIR/ping_results.txt"
     : > "$results"
-    local url host port
+    local url host port hp
     while IFS= read -r url; do
         [[ -z "$url" ]] && continue
-        host=$(echo "$url" | sed -n 's|^vless://[^@]*@\([^:]*\):.*|\1|p')
-        port=$(echo "$url" | sed -n 's|^vless://[^@]*@[^:]*:\([0-9]*\).*|\1|p')
-        if [[ -n "$host" && -n "$port" ]]; then
-            ping_host "$host" "$port" >> "$results" &
-        fi
+        hp="$(url_host_port "$url")" || continue
+        host="${hp% *}"; port="${hp##* }"
+        [[ -n "$host" && -n "$port" ]] || continue
+        ping_host "$host" "$port" | awk -v u="$url" '{print $1"\t"u}' >> "$results" &
     done < "$poolfile"
     wait
 
     # Сортируем по latency, отбрасываем недоступные
-    sort -n "$results" | awk '$1 < 99999' | head -n "${MAX_TRIES}"
+    sort -n "$results" | awk -F'\t' '$1 < 99999' | head -n "${MAX_TRIES}"
 }
 
-# === Скачивание подписки с авто-декодированием base64 ===
-# Многие провайдеры (V2Board/Marzban) отдают подписку в base64. Пишем в $1 декодированный текст.
-download_subscription() {
-    local out="$1"
-    # Разовый источник через --subs: готовый файл с ключами (без скачивания)
-    if [[ -n "${OCVPN_SUBS_FILE:-}" ]]; then
-        [[ -f "$OCVPN_SUBS_FILE" ]] || { err "Файл ключей не найден: $OCVPN_SUBS_FILE"; return 1; }
-        grep -qE '^vless://' "$OCVPN_SUBS_FILE" \
-            || { err "В файле нет vless:// ключей: $OCVPN_SUBS_FILE"; return 1; }
-        cp "$OCVPN_SUBS_FILE" "$out"
-        log "Ключи из файла: $OCVPN_SUBS_FILE (разово, не сохраняется)"
+# GitHub blob -> raw: иначе curl качает HTML-страницу, а не текст ключей.
+normalize_subs_url() {
+    local u="$1"
+    if [[ "$u" =~ ^https?://github\.com/([^/]+)/([^/]+)/blob/(.+)$ ]]; then
+        printf 'https://raw.githubusercontent.com/%s/%s/%s' \
+            "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    elif [[ "$u" =~ ^https?://github\.com/([^/]+)/([^/]+)/raw/(.+)$ ]]; then
+        printf 'https://raw.githubusercontent.com/%s/%s/%s' \
+            "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    else
+        printf '%s' "$u"
+    fi
+}
+
+# Один источник -> ключи в stdout. Источник: готовый ключ, локальный файл
+# (может содержать и ключи, и URL-ы подписок) или http(s)-URL подписки.
+_fetch_one_source() {
+    local src="$1"
+    [[ -z "$src" || "$src" == \#* ]] && return 0
+    # готовый прокси-ключ (http/https тут НЕ ключ — см. ниже, это источник-подписка)
+    if [[ "$src" =~ ^(vless|vmess|trojan|ss|socks|socks5|socks5h):// ]]; then
+        printf '%s\n' "$src"
         return 0
     fi
-    local raw="$TMPDIR/sub_raw.$$"
-    curl -fsSL --connect-timeout 10 "$SUBS_URL" -o "$raw" 2>/dev/null || { err "Не удалось скачать подписку"; return 1; }
-
-    # Если это чистый vless-текст — используем как есть
-    if grep -qE '^vless://' "$raw"; then
-        cp "$raw" "$out"
-    else
-        # Пытаемся декодировать base64
-        if base64 -d "$raw" > "$out" 2>/dev/null && grep -qE '^(vless|vmess|ss|trojan)://' "$out"; then
-            log "Подписка в base64 — декодирована."
-        else
-            cp "$raw" "$out"
-        fi
+    # http(s)://host:port — это HTTP-прокси-ключ, а не ссылка на подписку
+    if [[ "$src" =~ ^https?://[^/]+:[0-9]+ ]]; then
+        printf '%s\n' "$src"
+        return 0
     fi
-    rm -f "$raw"
+    # локальный файл: рекурсивно разбираем строки
+    if [[ -f "$src" ]]; then
+        local line
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            _fetch_one_source "$line"
+        done < "$src"
+        return 0
+    fi
+    # URL подписки
+    if [[ "$src" =~ ^https?:// ]]; then
+        local url raw
+        url="$(normalize_subs_url "$src")"
+        [[ "$url" != "$src" ]] && log "  GitHub blob → raw: $url"
+        raw="$(mktemp "$TMPDIR/src.XXXXXX")"
+        if ! curl -fsSL --connect-timeout 10 "$url" -o "$raw" 2>/dev/null; then
+            err "  не удалось скачать источник: $src"
+            rm -f "$raw"
+            return 1
+        fi
+        if grep -qE "$SUPPORTED_RE" "$raw"; then
+            cat "$raw"
+        elif base64 -d < "$raw" 2>/dev/null | grep -qE "$SUPPORTED_RE"; then
+            base64 -d < "$raw"
+        else
+            # возможно, это текстовый файл со списком ссылок на подписки
+            local l
+            while IFS= read -r l || [[ -n "$l" ]]; do
+                [[ -z "$l" || "$l" == \#* ]] && continue
+                [[ "$l" =~ ^https?:// ]] && _fetch_one_source "$l"
+            done < "$raw"
+        fi
+        rm -f "$raw"
+        return 0
+    fi
+    warn "  пропускаю непонятный источник: $src"
+    return 1
 }
 
-# Поддерживаем ли мы тип ключа (только vless-типы, что умеет vless_to_xray)
+# === Сбор ключей из всех источников (env > ~/.ocvpn-subs-url > /etc/ocvpn/subs-url).
+# Файл может содержать НЕСКОЛЬКО ссылок (по строке) — берём все разом. ===
+download_subscription() {
+    local out="$1"
+    : > "$out"
+
+    if [[ -n "${OCVPN_SUBS_FILE:-}" ]]; then
+        [[ -f "$OCVPN_SUBS_FILE" ]] || { err "Файл ключей не найден: $OCVPN_SUBS_FILE"; return 1; }
+        _fetch_one_source "$OCVPN_SUBS_FILE" >> "$out"
+    else
+        local sources=() line
+        if [[ -n "${OCVPN_SUBS_URL:-}" ]]; then
+            sources+=("$OCVPN_SUBS_URL")
+        elif [[ -s "$HOME/.ocvpn-subs-url" ]]; then
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                sources+=("$line")
+            done < "$HOME/.ocvpn-subs-url"
+        elif [[ -s /etc/ocvpn/subs-url ]]; then
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                sources+=("$line")
+            done < /etc/ocvpn/subs-url
+        else
+            sources=("$SUBS_FALLBACK_URL")
+        fi
+        if [[ ${#sources[@]} -eq 0 ]]; then
+            sources=("$SUBS_FALLBACK_URL")
+        fi
+        local s
+        for s in "${sources[@]}"; do
+            _fetch_one_source "$s" >> "$out"
+        done
+    fi
+
+    # оставляем только поддерживаемые схемы и убираем дубли
+    if [[ -s "$out" ]]; then
+        grep -E "$SUPPORTED_RE" "$out" | sort -u > "$out.uniq" || true
+        mv "$out.uniq" "$out"
+    fi
+    [[ -s "$out" ]] || { err "В источниках нет поддерживаемых ключей"; return 1; }
+    log "Ключей собрано: $(grep -c . "$out")."
+}
+
+# Поддерживаем ли ключ (vless/vmess/trojan/ss; типы транспорта, что умеет xray)
 is_supported_key() {
-    local url="$1" t
+    local url="$1" t scheme
+    scheme="${url%%://*}"
+    case "$scheme" in
+        vmess|ss|http|https|socks|socks5|socks5h) return 0 ;;
+        vless|trojan) ;;
+        *) return 1 ;;
+    esac
     # тип берём строго из параметра type=, а не из подстроки во всём URL
     t=$(printf '%s' "$url" | sed -n 's/.*[?&]type=\([^&#]*\).*/\1/p')
     [[ -z "$t" ]] && t="tcp"
@@ -899,12 +1441,12 @@ fetch_subscription() {
     SUBS_FILE="$TMPDIR/subs.txt"
     download_subscription "$SUBS_FILE" || return 1
     local total
-    total=$(grep -cE '^vless://' "$SUBS_FILE")
+    total=$(grep -cE "$SUPPORTED_RE" "$SUBS_FILE")
     if [[ "$total" -eq 0 ]]; then
-        err "Нет vless серверов в подписке"
+        err "Нет поддерживаемых серверов (vless/vmess/trojan/ss) в подписке"
         return 1
     fi
-    log "Найдено $total серверов (vless)."
+    log "Найдено $total серверов."
 }
 
 # pick_working_key [exclude_ip]: перебирает кандидатов, поднимает рабочий xray.
@@ -912,38 +1454,38 @@ fetch_subscription() {
 # Кандидаты из карантина и с exclude_ip пропускаются (нужен ДРУГОЙ выходной IP).
 pick_working_key() {
     local exclude_ip="${1:-}"
-    local candidates
-    mapfile -t candidates < <(select_candidates "$SUBS_FILE")
+    local candidates=()
+    while IFS= read -r __c; do
+        candidates+=("$__c")
+    done < <(select_candidates "$SUBS_FILE")
 
     if [[ ${#candidates[@]} -eq 0 ]]; then
         err "Ни один из ${BATCH_SIZE} серверов не ответил на ping. Пробую расширенный пул..."
-        mapfile -t candidates < <(grep -E '^vless://' "$SUBS_FILE" | while IFS= read -r u; do
+        while IFS= read -r __c; do
+            candidates+=("$__c")
+        done < <(grep -E "$SUPPORTED_RE" "$SUBS_FILE" | while IFS= read -r u; do
             is_supported_key "$u" && echo "$u"
-        done | shuf | head -n "${MAX_TRIES}" \
+        done | shuffle | head -n "${MAX_TRIES}" \
             | while IFS= read -r url; do
-                host=$(echo "$url" | sed -n 's|^vless://[^@]*@\([^:]*\):.*|\1|p')
-                port=$(echo "$url" | sed -n 's|^vless://[^@]*@[^:]*:\([0-9]*\).*|\1|p')
-                [[ -n "$host" && -n "$port" ]] && echo "99999 $host $port"
+                printf '99999\t%s\n' "$url"
             done)
+    fi
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        err "Нет кандидатов для подключения."
+        return 1
     fi
 
     log "Кандидаты (по пингу):"
     local tried=0
     for cand in "${candidates[@]}"; do
         tried=$((tried+1))
-        local host cport
-        host=$(echo "$cand" | awk '{print $2}')
-        cport=$(echo "$cand" | awk '{print $3}')
-        # Найти URL по host:port из основного списка (предпочтительно поддерживаемого типа)
-        local url=""
-        while IFS= read -r u; do
-            if is_supported_key "$u"; then url="$u"; break; fi
-        done < <(grep -E "^vless://[^@]*@${host}:${cport}" "$SUBS_FILE" || true)
-        if [[ -z "$url" ]]; then
-            # fallback: любой vless с этим host:port
-            url=$(grep -m1 -E "^vless://[^@]*@${host}:${cport}" "$SUBS_FILE" || true)
-        fi
-        [[ -z "$url" ]] && { warn "  нет URL для ${host}:${cport}, пропускаю"; continue; }
+        local host cport url hp
+        url="${cand#*$'\t'}"
+        hp="$(url_host_port "$url")" || { warn "  не разобрать URL, пропускаю"; continue; }
+        host="${hp% *}"; cport="${hp##* }"
+        [[ -n "$url" && -n "$host" && -n "$cport" ]] \
+            || { warn "  нет host:port у кандидата, пропускаю"; continue; }
         if quarantine_blocked "$host" "$cport" ""; then
             warn "  ${host}:${cport} в карантине, пропускаю"
             continue
@@ -957,7 +1499,7 @@ pick_working_key() {
         local workdir="$TMPDIR/node_$tried"
         mkdir -p "$workdir"
 
-        vless_to_xray "$url" "$workdir"
+        uri_to_xray "$url" "$workdir" || { warn "  не собрать конфиг, пропускаю"; continue; }
 
         "$XRAY_BIN" run -c "$workdir/config.json" &>/dev/null &
         XRAY_PID=$!
@@ -1117,7 +1659,7 @@ do_restart() {
     done
     mkdir -p "$(dirname "$OCVPN_LOG")"
     log "Подбираю новый ключ в фоне (лог $OCVPN_LOG)…"
-    setsid nohup "$0" </dev/null >>"$OCVPN_LOG" 2>&1 &
+    _spawn "$OCVPN_LOG" "$0"
     local bgpid=$!
     # Ждём свежий active.env (подбор: подписка+пинг+тесты, обычно < 90 сек)
     local j
@@ -1247,7 +1789,11 @@ parse_subs_flag() {
 # === Main ===
 print_help() {
     cat <<HELP_EOF
-ocvpn $OCVPN_VERSION — прозрачная маршрутизация эндпоинтов opencode через VLESS-VPN.
+ocvpn $OCVPN_VERSION — прозрачная маршрутизация эндпоинтов opencode через VPN.
+
+Поддерживаемые протоколы подписки: vless, vmess, trojan, shadowsocks (ss),
+http/https (прокси), socks/socks5. hysteria2 не поддерживается (это sing-box,
+в Xray-core его нет).
 
 Использование:
   ocvpn                  запустить в foreground (терминал занят, Ctrl-C = стоп + cleanup)
@@ -1258,12 +1804,13 @@ ocvpn $OCVPN_VERSION — прозрачная маршрутизация энд�
   ocvpn --restart        перезапустить в фоне: новый ключ + (обычно) новый IP
   ocvpn --rotate [why]   то же, что --new-ip (алиас)
 
-  --subs URL|ФАЙЛ       разовый источник ключей для запуска/рестарта
-                        (URL подписки или готовый txt с vless://; можно в любом
-                        месте строки: ocvpn --subs https://… --restart)
+  --subs URL|ФАЙЛ       разовый источник ключей для запуска/рестарта.
+                        Файл может содержать несколько ссылок на подписки
+                        и/или готовые ключи (по строке) — берутся все разом.
 
-  Источник ключей (приоритет): OCVPN_SUBS_URL (env) > ~/.ocvpn-subs-url
-  (файл) > /etc/ocvpn/subs-url (системный — для root/daemon/GUI) > публичный fallback.
+  Источники ключей: OCVPN_SUBS_URL (env) > ~/.ocvpn-subs-url (файл, можно
+  НЕСКОЛЬКО ссылок по строкам) > /etc/ocvpn/subs-url > публичный fallback.
+  GitHub-ссылки вида .../blob/... автоматически превращаются в raw.
 
   При подключении автоматически проверяется доступность моделей opencode
   из текущего региона (geo-block). Если модели недоступны — exit IP
@@ -1394,22 +1941,22 @@ main() {
             exit $?
             ;;
         --daemon|-d)
-            # Фон: двойной отрыв от терминала (setsid + nohup), лог в файл.
+            # Фон: отрыв от терминала (setsid, если есть, иначе голый & — см. _spawn).
             # Использование: ocvpn --daemon [те же аргументы, что и у обычного запуска]
             no_cleanup  # родитель никого не владеет — маршруты ставит потомок
             shift
             mkdir -p "$(dirname "$OCVPN_LOG")"
             # shellcheck disable=SC2094
-            setsid nohup "$0" "$@" </dev/null >>"$OCVPN_LOG" 2>&1 &
+            _spawn "$OCVPN_LOG" "$0" "$@"
             log "ocvpn $OCVPN_VERSION запущен в фоне (pid $!, лог $OCVPN_LOG)"
             exit 0
             ;;
         --cleanup)
             no_cleanup  # чистим явно ниже, EXIT-trap не нужен
             mkdir -p "$TMPDIR_BASE"
+            stop_all
             cleanup_routes
-            rm -f "$ACTIVE_FILE" "$WATCH_PIDFILE" 2>/dev/null || true
-            log "Маршрутизация opencode-VPN отключена. Хост как был."
+            log "OCVPN остановлен: xray/вотчдог убиты, маршруты сняты."
             exit 0
             ;;
     esac
@@ -1434,6 +1981,8 @@ main() {
 
     OCVPN_OWNER=1  # этот процесс владеет xray+маршрутами — EXIT-trap активен
     mkdir -p "$TMPDIR_BASE"
+    # Singleton: гасим прошлые держатели/xray/вотчдоги, чтобы не плодить дубли.
+    stop_all
     TMPDIR=$(mktemp -d "$TMPDIR_BASE/XXXXXX")
 
     find_xray
@@ -1451,4 +2000,7 @@ main() {
     supervise
 }
 
-main "$@"
+# Запуск main только при исполнении файла, не при source (нужно для тестов/покрытия).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
