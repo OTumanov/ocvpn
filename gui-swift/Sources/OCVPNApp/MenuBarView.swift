@@ -66,10 +66,7 @@ struct MenuBarView: View {
         busy = true
         let wasOn = connected
         DispatchQueue.global().async {
-            let cmd =
-                wasOn
-                ? "/bin/bash \(ContentView.backend) --cleanup"
-                : envPrefix() + "/bin/bash \(ContentView.backend) --daemon"
+            let cmd = wasOn ? stopCommand() : startCommand()
             let r = runAdmin(cmd)
             glog("menubar \(wasOn ? "stop" : "start"): rc=\(r.ok) tail=\(r.out.suffix(200))")
             DispatchQueue.main.async {
@@ -82,7 +79,7 @@ struct MenuBarView: View {
     private func newIP() {
         busy = true
         DispatchQueue.global().async {
-            let r = runAdmin(envPrefix() + "/bin/bash \(ContentView.backend) --new-ip")
+            let r = runAdmin(newIpCommand())
             glog("menubar newip: rc=\(r.ok) tail=\(r.out.suffix(200))")
             DispatchQueue.main.async {
                 busy = false

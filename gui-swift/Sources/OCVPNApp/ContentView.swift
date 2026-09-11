@@ -428,10 +428,7 @@ struct ContentView: View {
         let wasOn = connected
         detail = wasOn ? "Отключаю…" : "Подключаю…"
         DispatchQueue.global().async {
-            let cmd =
-                wasOn
-                ? "/bin/bash \(Self.backend) --cleanup"
-                : envPrefix() + "/bin/bash \(Self.backend) --daemon"
+            let cmd = wasOn ? stopCommand() : startCommand()
             let r = runAdmin(cmd)
             glog("action \(wasOn ? "stop" : "start"): rc=\(r.ok) tail=\(r.out.suffix(200))")
             DispatchQueue.main.async {
@@ -448,7 +445,7 @@ struct ContentView: View {
         busy = true
         detail = "Меняю IP…"
         DispatchQueue.global().async {
-            let r = runAdmin(envPrefix() + "/bin/bash \(Self.backend) --new-ip")
+            let r = runAdmin(newIpCommand())
             glog("action newip: rc=\(r.ok) tail=\(r.out.suffix(200))")
             DispatchQueue.main.async {
                 busy = false
@@ -466,11 +463,7 @@ struct ContentView: View {
         busy = true
         DispatchQueue.global().async {
             let r: (ok: Bool, out: String)
-            if want {
-                r = runAdmin(envPrefix() + "/bin/bash \(Self.backend) --daemon --watch")
-            } else {
-                r = runAdmin("/usr/bin/pkill -f 'ocvpn --watch'")
-            }
+            r = runAdmin(watchCommand(want))
             glog("action watch(\(want)): rc=\(r.ok) tail=\(r.out.suffix(200))")
             DispatchQueue.main.async {
                 autoChanging = false
@@ -501,10 +494,7 @@ struct ContentView: View {
         glog("subs: saved \(userFile)")
         busy = true
         DispatchQueue.global().async {
-            let q = url.replacingOccurrences(of: "'", with: "'\\''")
-            let cmd =
-                "mkdir -p /etc/ocvpn && printf '%s' '\(q)' > /etc/ocvpn/subs-url"
-                + " && chmod 600 /etc/ocvpn/subs-url && echo SAVED"
+            let cmd = subsSystemSaveCommand(url)
             let r = runAdmin(cmd)
             glog("subs: system save rc=\(r.ok) tail=\(r.out.suffix(120))")
             DispatchQueue.main.async {
@@ -529,13 +519,13 @@ struct ContentView: View {
 
 // MARK: - backend
 
-private func opError(_ what: String, _ out: String) -> String {
+func opError(_ what: String, _ out: String) -> String {
     let first = firstLine(out)
     if first.isEmpty { return "Не удалось \(what): отмена или нет прав (введи пароль в диалоге macOS)." }
     return "Не удалось \(what): \(first)"
 }
 
-private func firstLine(_ s: String) -> String {
+func firstLine(_ s: String) -> String {
     s.components(separatedBy: "\n").first(where: { !$0.isEmpty }) ?? ""
 }
 
@@ -545,6 +535,27 @@ func envPrefix() -> String {
         .trimmingCharacters(in: .whitespacesAndNewlines)
     guard !u.isEmpty else { return "" }
     return "OCVPN_SUBS_URL='\(u.replacingOccurrences(of: "'", with: "'\\''"))' "
+}
+
+// Команды для кнопок (вынесены, чтобы юнит-тестировать без запуска osascript).
+func startCommand() -> String {
+    envPrefix() + "/bin/bash \(ContentView.backend) --daemon"
+}
+func stopCommand() -> String {
+    "/bin/bash \(ContentView.backend) --cleanup"
+}
+func newIpCommand() -> String {
+    envPrefix() + "/bin/bash \(ContentView.backend) --new-ip"
+}
+func watchCommand(_ want: Bool) -> String {
+    want
+        ? envPrefix() + "/bin/bash \(ContentView.backend) --daemon --watch"
+        : "/usr/bin/pkill -f 'ocvpn --watch'"
+}
+func subsSystemSaveCommand(_ url: String) -> String {
+    let q = url.replacingOccurrences(of: "'", with: "'\\''")
+    return "mkdir -p /etc/ocvpn && printf '%s' '\(q)' > /etc/ocvpn/subs-url"
+        + " && chmod 600 /etc/ocvpn/subs-url && echo SAVED"
 }
 
 func queryState() -> (on: Bool, detail: String) {
@@ -570,7 +581,7 @@ func queryState() -> (on: Bool, detail: String) {
     return (false, "прокси не отвечает")
 }
 
-private func tcpOpen(port: Int) -> Bool {
+func tcpOpen(port: Int) -> Bool {
     var addr = sockaddr_in()
     addr.sin_family = sa_family_t(truncatingIfNeeded: AF_INET)
     addr.sin_port = in_port_t(truncatingIfNeeded: port).bigEndian
@@ -606,7 +617,7 @@ private func watchPid() -> Int? {
 
 /// Хвост лога bounded: читаем только последние 32 КБ через seek
 /// (целиком файл в память НЕ грузим — так и едят оперативу).
-private func tailLog(_ n: Int) -> String {
+func tailLog(_ n: Int) -> String {
     guard let fh = try? FileHandle(forReadingFrom: URL(fileURLWithPath: ContentView.logPath))
     else { return "" }
     defer { try? fh.close() }
@@ -623,12 +634,12 @@ private func tailLog(_ n: Int) -> String {
     return clean.components(separatedBy: "\n").suffix(n).joined(separator: "\n")
 }
 
-private func readFirstLine(_ path: String) -> String {
+func readFirstLine(_ path: String) -> String {
     (try? String(contentsOfFile: path))?.components(separatedBy: "\n").first?
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 }
 
-private func readSubsStatus() -> (ok: Bool, text: String, prefill: String) {
+func readSubsStatus() -> (ok: Bool, text: String, prefill: String) {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     let userURL = readFirstLine("\(home)/.ocvpn-subs-url")
     let sysFile = "/etc/ocvpn/subs-url"

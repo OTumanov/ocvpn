@@ -59,6 +59,7 @@ run_batch "coverage (tests/ocvpn-coverage.sh)" "$LIMIT" bash "$HERE/ocvpn-covera
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
     run_batch "macOS app bundle (tests/macos-app-test.sh)" "$LIMIT" bash "$HERE/macos-app-test.sh"
+    run_batch "Swift app units (tests/swift-run.sh)" "$LIMIT" bash "$HERE/swift-run.sh"
 fi
 
 echo
