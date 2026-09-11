@@ -5,7 +5,7 @@ set -euo pipefail
 # (в частности под sudo/systemd с урезанным PATH). Добавляем, не затирая остальное.
 export PATH="/usr/sbin:/sbin:$PATH"
 
-OCVPN_VERSION="1.5.2"
+OCVPN_VERSION="1.5.3"
 # Linux (iptables REDIRECT) или macOS (pf rdr). Определяем один раз.
 OCVPN_OS="$(uname -s 2>/dev/null || echo Linux)"
 is_macos() { [[ "$OCVPN_OS" == "Darwin" ]]; }
@@ -143,6 +143,8 @@ stop_all() {
     sleep 1
     _kill_matching 'xray run -c /tmp/opencode-vpn'
     _kill_matching 'ocvpn(\.sh)?$'
+    # вотчдог может висеть в `tail -F` и не обрабатывать TERM — добиваем.
+    pkill -9 -f 'ocvpn --watch' 2>/dev/null || true
     rm -f "$ACTIVE_FILE" "$WATCH_PIDFILE" "$LAST_ROTATE_FILE" \
         "$REASON_FILE" "$ROTATE_HOUR_FILE" 2>/dev/null || true
 }
