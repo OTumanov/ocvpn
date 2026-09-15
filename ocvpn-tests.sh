@@ -548,6 +548,30 @@ else
     FAIL=$((FAIL+1)); echo "  ▸ help geo-check docs: FAIL"
 fi
 
+echo "=== [7] opencode: команда /ocvpn, детект, свой хост ==="
+REPO_DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+TMPH="$(mktemp -d)"
+env -u SUDO_USER HOME="$TMPH" bash "$SCRIPT" --install-opencode-command >/dev/null 2>&1
+[[ -f "$TMPH/.config/opencode/commands/ocvpn.md" ]] && { PASS=$((PASS+1)); echo "  ▸ cmd install: OK"; } || { FAIL=$((FAIL+1)); echo "  ▸ cmd install: FAIL"; }
+diff -q "$TMPH/.config/opencode/commands/ocvpn.md" "$REPO_DIR/opencode/ocvpn.md" >/dev/null 2>&1 && { PASS=$((PASS+1)); echo "  ▸ cmd content: OK"; } || { FAIL=$((FAIL+1)); echo "  ▸ cmd content: FAIL"; }
+rm -rf "$TMPH"
+for flag in --install-opencode-command --ensure-opencode --add-host --rm-host --hosts; do
+    if bash "$SCRIPT" --help 2>/dev/null | grep -q -- "$flag"; then
+        PASS=$((PASS+1)); echo "  ▸ help $flag: OK"
+    else
+        FAIL=$((FAIL+1)); echo "  ▸ help $flag: FAIL"
+    fi
+done
+for pair in "packaging/debian/postinst:install-opencode-command" "packaging/debian/postinst:ensure-opencode" \
+            "packaging/macos/install.sh:install-opencode-command" "packaging/macos/install.sh:ensure-opencode"; do
+    f="${pair%%:*}"; pat="${pair##*:}"
+    if grep -q -- "$pat" "$REPO_DIR/$f"; then
+        PASS=$((PASS+1)); echo "  ▸ $f $pat: OK"
+    else
+        FAIL=$((FAIL+1)); echo "  ▸ $f $pat: FAIL"
+    fi
+done
+
 echo ""
 echo "Итог: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

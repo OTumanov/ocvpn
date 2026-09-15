@@ -9,5 +9,8 @@ if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
 else
     echo "ocvpn: systemd не найден — запуск вручную: ocvpn --daemon"
 fi
+# Команда /ocvpn в opencode (для пользователя установки) + детект opencode.
+/usr/local/bin/ocvpn --install-opencode-command >/dev/null 2>&1 || true
+/usr/local/bin/ocvpn --ensure-opencode auto >/dev/null 2>&1 || true
 #DEBHELPER#
 exit 0

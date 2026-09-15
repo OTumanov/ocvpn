@@ -81,6 +81,9 @@ fi
 
 # Подписка (пример): OCVPN_SUBS_URL="https://…" sudo -E ./install.sh
 # положит URL в /etc/ocvpn/subs-url (chmod 600)
+# Команда /ocvpn в opencode + детект opencode (интерактивно, если терминал)
+/usr/local/bin/ocvpn --install-opencode-command || true
+/usr/local/bin/ocvpn --ensure-opencode auto || true
 /usr/local/bin/ocvpn --version
 echo "Готово. GUI: /Applications/OCVPN.app. CLI: ocvpn --help"
 echo "Подписка: OCVPN_SUBS_URL, ~/.ocvpn-subs-url или /etc/ocvpn/subs-url — иначе публичный fallback."

@@ -4,8 +4,10 @@ set -euo pipefail
 # iptables обычно лежит в /usr/sbin или /sbin, которых может не быть в PATH
 # (в частности под sudo/systemd с урезанным PATH). Добавляем, не затирая остальное.
 export PATH="/usr/sbin:/sbin:$PATH"
+# systemd/launchd system-сервис не задаёт HOME — иначе set -u роняет скрипт.
+export HOME="${HOME:-/root}"
 
-OCVPN_VERSION="1.5.4"
+OCVPN_VERSION="1.5.5"
 # Linux (iptables REDIRECT) или macOS (pf rdr). Определяем один раз.
 OCVPN_OS="$(uname -s 2>/dev/null || echo Linux)"
 is_macos() { [[ "$OCVPN_OS" == "Darwin" ]]; }
@@ -37,13 +39,14 @@ shuffle() {
 # === Config ===
 # Приоритет подписки: $OCVPN_SUBS_URL (env) > ~/.ocvpn-subs-url (файл пользователя)
 #   > /etc/ocvpn/subs-url (системный — виден root/daemon/GUI через osascript) > fallback
-SUBS_FALLBACK_URL="https://raw.githubusercontent.com/zxcursedzxc0721/vless-subscriptions/refs/heads/main/ru/vless.txt"
+SUBS_FALLBACK_URL="https://xo.e0f.cx/sub/cE9h4oad4JvM0Pjk"
+SYS_SUBS_FILE="${OCVPN_SYS_SUBS_FILE:-/etc/ocvpn/subs-url}"
 SUBS_URL="${OCVPN_SUBS_URL:-}"
 if [[ -z "$SUBS_URL" && -s "$HOME/.ocvpn-subs-url" ]]; then
     SUBS_URL="$(head -n1 "$HOME/.ocvpn-subs-url" 2>/dev/null | tr -d '[:space:]')"
 fi
-if [[ -z "$SUBS_URL" && -s /etc/ocvpn/subs-url ]]; then
-    SUBS_URL="$(head -n1 /etc/ocvpn/subs-url 2>/dev/null | tr -d '[:space:]')"
+if [[ -z "$SUBS_URL" && -s "$SYS_SUBS_FILE" ]]; then
+    SUBS_URL="$(head -n1 "$SYS_SUBS_FILE" 2>/dev/null | tr -d '[:space:]')"
 fi
 SUBS_URL="${SUBS_URL:-$SUBS_FALLBACK_URL}"
 # Схемы, которые умеет наш конвертер в xray-outbound.
@@ -69,6 +72,8 @@ OCVPN_LOG="${OCVPN_LOG:-/var/log/ocvpn.log}"
 # Эндпоинты opencode, которые будут ходить через VPN.
 # ВАЖНО: api.deepseek.com и ollama.com/api.ollama.com НЕ в списке — они ходят
 # напрямую (DIRECT), их через VPN не заворачиваем.
+# Пользовательские домены для обхода через VPN (добавляются `ocvpn --add-host`).
+USER_HOSTS_FILE="${OCVPN_USER_HOSTS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/ocvpn/hosts}"
 OPENCODE_DOMAINS=(
     # --- Инфраструктура OpenCode (v1.18.30) ---
     "opencode.ai"          # console auth/device, /console/api/*, Zen (/zen/v1), Go (/zen/go/v1)
@@ -78,9 +83,33 @@ OPENCODE_DOMAINS=(
     "opncd.ai"             # share-сервис
     # --- Провайдеры моделей, которым нужен VPN ---
     "openrouter.ai"        # OpenRouter
+    "www.openrouter.ai"    # OpenRouter (тот же API)
     "zenmux.ai"            # ZenMux
     "auth.openai.com"      # OpenAI OAuth
+    # --- OpenAI / ChatGPT ---
+    "api.openai.com"       # OpenAI API
+    "chatgpt.com"          # ChatGPT
+    "chat.openai.com"      # ChatGPT (старый домен)
+    "platform.openai.com"  # OpenAI platform/dashboard
+    # --- Google Gemini ---
+    "generativelanguage.googleapis.com"  # Gemini API
+    "gemini.google.com"    # Gemini
+    "aistudio.google.com"  # Google AI Studio
+    "ai.google.dev"        # Gemini docs
+    # --- xAI / Grok ---
+    "api.x.ai"             # xAI (Grok) API
+    "grok.com"             # Grok
+    "x.ai"                 # xAI
 )
+# Домены из пользовательского файла — в общий список (по строке, # — комментарий).
+if [[ -f "$USER_HOSTS_FILE" ]]; then
+    while IFS= read -r _uh || [[ -n "$_uh" ]]; do
+        _uh="${_uh%%#*}"; _uh="${_uh//[[:space:]]/}"
+        [[ -z "$_uh" ]] && continue
+        OPENCODE_DOMAINS+=("$_uh")
+    done < "$USER_HOSTS_FILE"
+    unset _uh
+fi
 
 # === Colors ===
 RED='\033[0;31m'
@@ -123,6 +152,14 @@ _kill_matching() {
     done < <(pgrep -f "$pat" 2>/dev/null || true)
 }
 
+_kill_matching9() {
+    local pat="$1" pid
+    while IFS= read -r pid; do
+        [[ -z "$pid" || "$pid" == "$$" ]] && continue
+        kill -9 "$pid" 2>/dev/null || true
+    done < <(pgrep -f "$pat" 2>/dev/null || true)
+}
+
 # Полная остановка: держатели, xray, вотчдоги + файлы состояния.
 # Нужна для --cleanup и чтобы не плодить дубли при повторном запуске.
 stop_all() {
@@ -143,7 +180,7 @@ stop_all() {
     _kill_matching 'xray run -c /tmp/opencode-vpn'
     _kill_matching 'ocvpn(\.sh)?$'
     # вотчдог может висеть в `tail -F` и не обрабатывать TERM — добиваем.
-    pkill -9 -f 'ocvpn --watch' 2>/dev/null || true
+    _kill_matching9 'ocvpn --watch'
     rm -f "$ACTIVE_FILE" "$WATCH_PIDFILE" "$LAST_ROTATE_FILE" \
         "$REASON_FILE" "$ROTATE_HOUR_FILE" 2>/dev/null || true
 }
@@ -195,12 +232,13 @@ cleanup_routes_linux() {
 
 # === Форсировать IPv4-резолв эндпоинтов через /etc/hosts (маркер opencode-vpn) ===
 HOSTS_MARK="# opencode-vpn"
+HOSTS_FILE="${OCVPN_HOSTS_FILE:-/etc/hosts}"
 hosts_setup() {
     local tmp
     mkdir -p "$TMPDIR_BASE" 2>/dev/null || true
     tmp=$(mktemp "${TMPDIR_BASE}/hosts.XXXXXX")
     # убрать старый блок
-    sed "/^[^#]*$HOSTS_MARK\$/d" /etc/hosts > "$tmp" 2>/dev/null || cp /etc/hosts "$tmp"
+    sed "/^[^#]*$HOSTS_MARK\$/d" "$HOSTS_FILE" > "$tmp" 2>/dev/null || cp "$HOSTS_FILE" "$tmp"
     # собрать IPv4-адреса доменов
     local ip d
     # дедуп по строке через awk (ассоц. массивов нет в bash 3.2 из macOS)
@@ -214,20 +252,23 @@ hosts_setup() {
     } | awk '!seen[$0]++' >> "$tmp"
     # записать только если есть добавленные строки с маркером
     if grep -q -- "$HOSTS_MARK" "$tmp"; then
-        cp "$tmp" /etc/hosts
+        cp "$tmp" "$HOSTS_FILE"
         log "Добавлены IPv4-записи opencode в /etc/hosts (для принудительной IPv4-маршрутизации)"
+    elif grep -q -- "$HOSTS_MARK" "$HOSTS_FILE" 2>/dev/null; then
+        # ни один домен не отрезолвился — убираем устаревшие наши записи
+        cp "$tmp" "$HOSTS_FILE"
     fi
     rm -f "$tmp"
 }
 
 hosts_cleanup() {
     # Нет наших записей — /etc/hosts не трогаем вообще (ни mtime, ни содержимого).
-    grep -q -- "$HOSTS_MARK" /etc/hosts 2>/dev/null || return 0
+    grep -q -- "$HOSTS_MARK" "$HOSTS_FILE" 2>/dev/null || return 0
     local tmp
     mkdir -p "$TMPDIR_BASE" 2>/dev/null || true
     tmp=$(mktemp "${TMPDIR_BASE}/hosts.XXXXXX")
-    sed "/$HOSTS_MARK\$/d" /etc/hosts > "$tmp"
-    cp "$tmp" /etc/hosts
+    sed "/$HOSTS_MARK\$/d" "$HOSTS_FILE" > "$tmp"
+    cp "$tmp" "$HOSTS_FILE"
     rm -f "$tmp"
 }
 
@@ -589,11 +630,15 @@ vless_to_xray() {
         eval "$v=\$decoded"
     done
 
+    [[ -n "$host" && -n "$port" && -n "$uuid" ]] || { warn "vless: битый URL"; return 1; }
+
     # Map xray network types (raw = reality over tcp)
     [[ "$type" == "raw" ]] && type="tcp"
 
     # Determine SNI: use sni param, fallback to host_param, fallback to host
     [[ -z "$sni" ]] && sni="${host_param:-$host}"
+    # Host для ws/xhttp-заголовка: явный host=, иначе sni.
+    local ws_host="${host_param:-$sni}"
 
     # Build TLS/reality settings
     local tls_settings=""
@@ -609,7 +654,8 @@ vless_to_xray() {
         "fingerprint": "${fp:-chrome}",
         "publicKey": "$pbk",
         "shortId": "$sid"
-    }$(xhttp_stream_settings "$type" "$path" "$sni" "$mode")
+    }$(ws_stream_settings "$type" "$path" "$ws_host")
+    $(xhttp_stream_settings "$type" "$path" "$ws_host" "$mode")
     $(grpc_stream_settings "$type" "$serviceName")
 }
 REALITY_EOF
@@ -630,8 +676,8 @@ print('\"alpn\": ['+','.join('\"'+a+'\"' for a in vals)+']')" 2>/dev/null || ech
         "serverName": "$sni",
         "allowInsecure": false$(if [[ -n "$alpn_json" ]]; then echo ",
         $alpn_json"; fi)
-    }$(ws_stream_settings "$type" "$path" "$sni")
-    $(xhttp_stream_settings "$type" "$path" "$sni" "$mode")
+    }$(ws_stream_settings "$type" "$path" "$ws_host")
+    $(xhttp_stream_settings "$type" "$path" "$ws_host" "$mode")
     $(grpc_stream_settings "$type" "$serviceName")
 }
 TLS_EOF
@@ -639,8 +685,8 @@ TLS_EOF
     else
         stream_settings=$(cat <<NONE_EOF
 {
-    "network": "$type"$(ws_stream_settings "$type" "$path" "$sni")
-    $(xhttp_stream_settings "$type" "$path" "$sni" "$mode")
+    "network": "$type"$(ws_stream_settings "$type" "$path" "$ws_host")
+    $(xhttp_stream_settings "$type" "$path" "$ws_host" "$mode")
     $(grpc_stream_settings "$type" "$serviceName")
 }
 NONE_EOF
@@ -789,11 +835,12 @@ trojan_to_xray() {
     done
     [[ "$type" == "raw" ]] && type="tcp"
     [[ -z "$sni" ]] && sni="${host_param:-$host}"
+    local ws_host="${host_param:-$sni}"
 
     local alpn_json=""
     if [[ -n "$alpn" ]]; then
-        alpn_json=$(printf '%s' "$alpn" | python3 -c "import sys
-raw=sys.stdin.read().strip()
+        alpn_json=$(printf '%s' "$alpn" | python3 -c "import sys,urllib.parse
+raw=urllib.parse.unquote(sys.stdin.read().strip())
 vals=[a.strip() for a in raw.split(',') if a.strip()]
 print('\"alpn\": ['+','.join('\"'+a+'\"' for a in vals)+']')" 2>/dev/null || echo "")
     fi
@@ -808,8 +855,8 @@ print('\"alpn\": ['+','.join('\"'+a+'\"' for a in vals)+']')" 2>/dev/null || ech
         "serverName": "$sni",
         "allowInsecure": false$(if [[ -n "$alpn_json" ]]; then echo ",
         $alpn_json"; fi)
-    }$(ws_stream_settings "$type" "$path" "$sni")
-    $(xhttp_stream_settings "$type" "$path" "$sni" "")
+    }$(ws_stream_settings "$type" "$path" "$ws_host")
+    $(xhttp_stream_settings "$type" "$path" "$ws_host" "")
     $(grpc_stream_settings "$type" "$serviceName")
 }
 TROJAN_TLS
@@ -817,8 +864,8 @@ TROJAN_TLS
     else
         stream_settings=$(cat <<TROJAN_NONE
 {
-    "network": "$type"$(ws_stream_settings "$type" "$path" "$sni")
-    $(xhttp_stream_settings "$type" "$path" "$sni" "")
+    "network": "$type"$(ws_stream_settings "$type" "$path" "$ws_host")
+    $(xhttp_stream_settings "$type" "$path" "$ws_host" "")
     $(grpc_stream_settings "$type" "$serviceName")
 }
 TROJAN_NONE
@@ -1028,7 +1075,7 @@ url_host_port() {
     local scheme="${url%%://*}" body hostport dec hp
     case "$scheme" in
         vless|trojan|http|https|socks|socks5|socks5h)
-            hostport="${url##*@}"; hostport="${hostport%%[/?#]*}"
+            hostport="${url#*://}"; hostport="${hostport##*@}"; hostport="${hostport%%[/?#]*}"
             ;;
         ss)
             body="${url#ss://}"; body="${body%%#*}"; body="${body%%\?*}"
@@ -1185,11 +1232,11 @@ download_subscription() {
                 [[ -z "$line" || "$line" == \#* ]] && continue
                 sources+=("$line")
             done < "$HOME/.ocvpn-subs-url"
-        elif [[ -s /etc/ocvpn/subs-url ]]; then
+        elif [[ -s "$SYS_SUBS_FILE" ]]; then
             while IFS= read -r line || [[ -n "$line" ]]; do
                 [[ -z "$line" || "$line" == \#* ]] && continue
                 sources+=("$line")
-            done < /etc/ocvpn/subs-url
+            done < "$SYS_SUBS_FILE"
         else
             sources=("$SUBS_FALLBACK_URL")
         fi
@@ -1344,7 +1391,9 @@ quarantine_blocked() {
 
 quarantine_count() {
     quarantine_prune
-    grep -c . "$QUARANTINE_FILE" 2>/dev/null || echo 0
+    local n
+    n="$(awk 'NF{c++} END{print c+0}' "$QUARANTINE_FILE" 2>/dev/null || echo 0)"
+    printf '%s' "${n:-0}"
 }
 
 # === Проверка доступности моделей через opencode API (geo-block детект) ===
@@ -1583,6 +1632,34 @@ pick_working_key() {
 }
 
 # Фиксирует активный ключ: маршруты + active.env для --rotate/--status/GUI
+# Сбросить уже открытые соединения opencode к эндпоинтам, чтобы новый exit IP
+# применился немедленно (keep-alive пулы держат старые сокеты). Нужен root;
+# без root — подсказка перезапустить opencode (терминал не нужен).
+reset_opencode_conns() {
+    if [[ "$(id -u 2>/dev/null || echo 1)" != "0" ]]; then
+        warn "Нет root: чтобы новый IP применился, перезапустите opencode (закрыть и открыть)."
+        return 0
+    fi
+    local ips ip n=0
+    if [[ -n "${OCVPN_RESET_IPS:-}" ]]; then
+        ips="$OCVPN_RESET_IPS"
+    else
+        ips="$(resolve_domains 2>/dev/null | sort -u || true)"
+    fi
+    [[ -n "$ips" ]] || return 0
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        if is_macos; then
+            pfctl -K "$ip" 2>/dev/null || true
+        else
+            ss -K dst "$ip" dport = :443 2>/dev/null || true
+        fi
+        n=$((n + 1))
+    done <<< "$ips"
+    [[ $n -gt 0 ]] && log "  сброшены активные соединения opencode ($n) — новый IP применится сразу"
+    return 0
+}
+
 activate_current() {
     log "  Настраиваю маршрутизацию только для эндпоинтов opencode..."
     setup_routes
@@ -1603,6 +1680,7 @@ activate_current() {
         echo "STARTED=$(date +%s)"
     } > "$tmp"
     mv "$tmp" "$ACTIVE_FILE"
+    reset_opencode_conns
 }
 
 # Ротация внутри держателя (по USR1 от --rotate/вотчдога).
@@ -1680,7 +1758,7 @@ do_restart() {
     local i
     for i in $(seq 1 15); do
         (exec 3<>/dev/tcp/127.0.0.1/$SOCKS_PORT) 2>/dev/null || break
-        exec 3>&- 2>/dev/null || true
+        { exec 3>&-; } 2>/dev/null || true
         sleep 1
     done
     mkdir -p "$(dirname "$OCVPN_LOG")"
@@ -1812,6 +1890,161 @@ parse_subs_flag() {
     fi
 }
 
+# === Пользовательские хосты: список/добавить/удалить ===
+hosts_list() {
+    local h
+    printf '%s\n' "${OPENCODE_DOMAINS[@]}" | awk 'NF && !seen[$0]++'
+}
+
+# Применить маршрутизацию на лету (без смены ключа), если VPN активен.
+apply_hosts_live() {
+    [[ -f "$ACTIVE_FILE" ]] || { log "VPN не активен — применится при следующем запуске ocvpn."; return 0; }
+    local xpid
+    xpid="$(grep -E '^XRAY_PID=' "$ACTIVE_FILE" 2>/dev/null | cut -d= -f2)"
+    if [[ -z "$xpid" ]] || ! kill -0 "$xpid" 2>/dev/null; then
+        log "Активного xray нет — применится при следующем запуске ocvpn."; return 0
+    fi
+    XRAY_PID="$xpid"
+    if setup_routes; then
+        log "Маршрутизация обновлена (с учётом изменения списка хостов)."
+    else
+        warn "Не удалось обновить маршруты на лету."
+    fi
+}
+
+add_host() {
+    local d="${1:-}"
+    d="${d//[[:space:]]/}"
+    if [[ -z "$d" || ! "$d" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]]; then
+        err "Укажи корректный домен: ocvpn --add-host example.com"
+        return 2
+    fi
+    mkdir -p "$(dirname "$USER_HOSTS_FILE")"
+    if grep -qxF "$d" "$USER_HOSTS_FILE" 2>/dev/null; then
+        log "Хост уже в списке: $d"
+    else
+        printf '%s\n' "$d" >> "$USER_HOSTS_FILE"
+        log "Добавлен хост для обхода через VPN: $d  (файл: $USER_HOSTS_FILE)"
+    fi
+    local present=0 h
+    for h in "${OPENCODE_DOMAINS[@]}"; do [[ "$h" == "$d" ]] && present=1; done
+    [[ $present -eq 0 ]] && OPENCODE_DOMAINS+=("$d")
+    apply_hosts_live
+}
+
+rm_host() {
+    local d="${1:-}"
+    d="${d//[[:space:]]/}"
+    [[ -z "$d" ]] && { err "Укажи домен: ocvpn --rm-host example.com"; return 2; }
+    if [[ ! -f "$USER_HOSTS_FILE" ]] || ! grep -qxF "$d" "$USER_HOSTS_FILE" 2>/dev/null; then
+        warn "Домена нет в списке: $d"
+        return 1
+    fi
+    local tmp; tmp="$(mktemp)"
+    grep -vxF "$d" "$USER_HOSTS_FILE" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$USER_HOSTS_FILE"
+    log "Удалён хост: $d"
+    local out=() h
+    for h in "${OPENCODE_DOMAINS[@]}"; do [[ "$h" == "$d" ]] || out+=("$h"); done
+    OPENCODE_DOMAINS=("${out[@]}")
+    apply_hosts_live
+}
+
+# Найти opencode: override, бинарь в PATH, либо конфиг. Печатает путь.
+opencode_present() {
+    if [[ -n "${OCVPN_OPENCODE_BIN:-}" && -x "${OCVPN_OPENCODE_BIN}" ]]; then
+        printf '%s' "$OCVPN_OPENCODE_BIN"; return 0
+    fi
+    local b
+    b="$(command -v opencode 2>/dev/null || true)"
+    [[ -n "$b" ]] && { printf '%s' "$b"; return 0; }
+    if [[ -d "$HOME/.config/opencode" || -d "$HOME/.local/share/opencode" ]]; then
+        printf '%s' "(конфиг найден, бинарь не в PATH)"; return 0
+    fi
+    return 1
+}
+
+# ensure_opencode [auto|ask|yes|no]: найти opencode; если нет — предложить
+# установку официальным инсталлятором. auto: ask при tty, иначе no.
+ensure_opencode() {
+    no_cleanup
+    local mode="${1:-auto}" where
+    if where="$(opencode_present)"; then
+        log "opencode найден: $where"
+        return 0
+    fi
+    if [[ "$mode" == auto ]]; then
+        if [[ -t 0 && -t 1 ]]; then mode=ask; else mode=no; fi
+    fi
+    if [[ "$mode" == ask ]]; then
+        local ans
+        read -r -p "opencode не найден. Установить сейчас? [Y/n]: " ans || ans=y
+        case "${ans:-y}" in y|Y|yes|Yes|"") mode=yes ;; *) mode=no ;; esac
+    fi
+    if [[ "$mode" == yes ]]; then
+        local cmd="${OCVPN_OPENCODE_INSTALL_CMD:-curl -fsSL https://opencode.ai/install | bash}"
+        log "Ставлю opencode…"
+        if bash -c "$cmd"; then
+            if where="$(opencode_present)"; then log "opencode установлен: $where"; return 0; fi
+            warn "opencode установлен, но не виден в PATH — перезапустите терминал."
+            return 0
+        fi
+        warn "Не удалось установить opencode: https://opencode.ai/docs/"
+        return 1
+    fi
+    warn "opencode не найден. Установите: curl -fsSL https://opencode.ai/install | bash (https://opencode.ai/docs/)"
+    return 0
+}
+
+# Установить команду /ocvpn в конфиг opencode. Идемпотентно. Целевой
+# пользователь: $SUDO_USER (при sudo-установке) либо $HOME.
+install_opencode_command() {
+    no_cleanup
+    local tgt_home cfg
+    if [[ -n "${OCVPN_OPENCODE_CMD_DIR:-}" ]]; then
+        cfg="$OCVPN_OPENCODE_CMD_DIR"
+    else
+        if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+            if is_macos; then
+                tgt_home="$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+            else
+                tgt_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+            fi
+            [[ -n "${tgt_home:-}" ]] || tgt_home="/home/$SUDO_USER"
+        else
+            tgt_home="$HOME"
+        fi
+        [[ -n "${tgt_home:-}" ]] || tgt_home="/root"
+        cfg="${XDG_CONFIG_HOME:-$tgt_home/.config}/opencode/commands"
+    fi
+    mkdir -p "$cfg" || { err "Не удалось создать $cfg"; return 1; }
+    cat > "$cfg/ocvpn.md" <<'OCVPN_CMD_MD'
+---
+description: Управление ocvpn — статус VPN, подписка, смена IP, свои хосты, старт/стоп
+---
+Ты — менеджер службы ocvpn (прозрачный VPN между opencode и эндпоинтами opencode/провайдеров).
+
+Сначала ВСЕГДА покажи состояние:
+1. `ocvpn --status` (и `systemctl is-active ocvpn.service`, если Linux).
+2. Кратко: сервис запущен? exit IP? какой источник подписки?
+
+Затем предложи меню:
+1. Сменить IP — `ocvpn --new-ip`. При root/passwordless-sudo соединения сбрасываются автоматически (новый IP применяется сразу). Если прав нет — сообщи: «Перезапустите opencode (закрыть и открыть заново)» — терминал не нужен.
+2. Подписка — спроси URL и выполни `ocvpn --subs <URL>`. При root продублируй: `printf '%s\n' '<URL>' > /etc/ocvpn/subs-url && chmod 600 /etc/ocvpn/subs-url`.
+3. Свой хост через VPN — спроси домен(ы) и выполни `ocvpn --add-host <домен>`; убрать — `ocvpn --rm-host <домен>`; показать список — `ocvpn --hosts`.
+4. Старт/стоп сервиса — Linux: `systemctl start|stop ocvpn`; macOS: `launchctl kickstart -k system/ai.opencode.ocvpn` / `launchctl bootout system/ai.opencode.ocvpn`.
+5. Очистка — `ocvpn --cleanup`.
+
+Правила:
+- Никогда не запускай интерактивный `sudo` (зависнет). Сначала `id -u`; если не root — `sudo -n true`.
+  Есть права → команды напрямую или через `sudo -n`. Нет → только `ocvpn --status`/`--subs`/`--hosts` и инструкция «перезапустите opencode».
+- Подкоманды: `/ocvpn ip|new-ip`, `/ocvpn subs <URL>`, `/ocvpn add-host <домен>`, `/ocvpn rm-host <домен>`, `/ocvpn hosts`, `/ocvpn start|stop`, `/ocvpn cleanup`, `/ocvpn status`.
+- Ничего сверх перечисленного не делай.
+OCVPN_CMD_MD
+    log "Команда /ocvpn установлена: $cfg/ocvpn.md"
+    return 0
+}
+
 # === Main ===
 print_help() {
     cat <<HELP_EOF
@@ -1830,6 +2063,11 @@ http/https (прокси), socks/socks5. hysteria2 не поддерживает
   ocvpn --restart        перезапустить в фоне: новый ключ + (обычно) новый IP
   ocvpn --rotate [why]   то же, что --new-ip (алиас)
 
+  ocvpn --install-opencode-command
+                         установить команду /ocvpn в конфиг opencode
+  ocvpn --ensure-opencode [auto|yes|no]
+                         найти opencode; если нет — предложить установку
+
   --subs URL|ФАЙЛ       разовый источник ключей для запуска/рестарта.
                         Файл может содержать несколько ссылок на подписки
                         и/или готовые ключи (по строке) — берутся все разом.
@@ -1842,6 +2080,9 @@ http/https (прокси), socks/socks5. hysteria2 не поддерживает
   из текущего региона (geo-block). Если модели недоступны — exit IP
   попадает в карантин на 12 ч, подключение отменяется, пробуется следующий.
 
+  ocvpn --add-host ДОМЕН  добавить свой хост для обхода через VPN (сразу, если активен)
+  ocvpn --rm-host ДОМЕН   убрать домен из пользовательского списка (файл: $USER_HOSTS_FILE)
+  ocvpn --hosts           показать итоговый список доменов (встроенные + свои)
   ocvpn --cleanup        снять маршрутизацию, убрать IPv4-записи из /etc/hosts
   ocvpn --status         показать состояние (xray, порты, маршруты, exit IP, карантин)
   ocvpn --version        версия
@@ -1865,7 +2106,7 @@ do_status() {
     for p in "$SOCKS_PORT" "$HTTP_PORT" "$REDIRECT_PORT"; do
         if (command -v ss &>/dev/null && ss -tln 2>/dev/null | grep -q ":$p ") \
             || (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null; then
-            exec 3>&- 2>/dev/null || true
+            { exec 3>&-; } 2>/dev/null || true
             echo "порт $p: слушается"
         else
             echo "порт $p: закрыт"
@@ -1888,10 +2129,10 @@ do_status() {
             rc=1
         fi
     fi
-    if grep -q -- "$HOSTS_MARK" /etc/hosts 2>/dev/null; then
-        echo "/etc/hosts: IPv4-записи есть ($(grep -c -- "$HOSTS_MARK" /etc/hosts))"
+    if grep -q -- "$HOSTS_MARK" "$HOSTS_FILE" 2>/dev/null; then
+        echo "$HOSTS_FILE: IPv4-записи есть ($(grep -c -- "$HOSTS_MARK" "$HOSTS_FILE"))"
     else
-        echo "/etc/hosts: IPv4-записей нет"
+        echo "$HOSTS_FILE: IPv4-записей нет"
         rc=1
     fi
     # Активный ключ / exit IP / карантин / вотчдог (всё read-only)
@@ -1949,10 +2190,33 @@ main() {
             echo "ocvpn $OCVPN_VERSION"
             exit 0
             ;;
+        --install-opencode-command)
+            install_opencode_command
+            exit $?
+            ;;
+        --ensure-opencode)
+            ensure_opencode "${2:-auto}"
+            exit $?
+            ;;
         --status)
             no_cleanup
             do_status
             exit $?
+            ;;
+        --add-host)
+            no_cleanup
+            add_host "${2:-}"
+            exit $?
+            ;;
+        --rm-host|--remove-host)
+            no_cleanup
+            rm_host "${2:-}"
+            exit $?
+            ;;
+        --hosts|--list-hosts)
+            no_cleanup
+            hosts_list
+            exit 0
             ;;
         --rotate|--new-ip)
             do_rotate "${2:-ручная ротация}"

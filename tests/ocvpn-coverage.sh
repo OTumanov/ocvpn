@@ -15,7 +15,7 @@ cleanup_test() {
     pkill -f 'sleep 12' 2>/dev/null || true
     pkill -f 'sleep 30' 2>/dev/null || true
     pkill -f 'fake-xray' 2>/dev/null || true
-    pkill -f 'tail -n0 -F' 2>/dev/null || true
+    pkill -f "tail -n0 -F $WORK" 2>/dev/null || true
     pkill -f 'threading.Event().wait' 2>/dev/null || true
     rm -rf "$WORK"
 }
@@ -45,6 +45,32 @@ check_true() { # name cmd...
 # shellcheck disable=SC1090
 source "$SCRIPT"
 set +e
+
+# === SAFETY: тесты НЕ должны убивать хостовые xray/ocvpn ===
+# stop_all/cleanup зовут _kill_matching по широким маскам ('xray run -c
+# /tmp/opencode-vpn', 'ocvpn$'). В тестах добиваем ТОЛЬКО собственные фейки
+# (fake-xray/fake-ocvpn) — иначе прогон убьёт рабочий VPN на машине.
+_kill_matching() {
+    local pid args
+    while IFS= read -r pid; do
+        [[ -z "$pid" || "$pid" == "$$" ]] && continue
+        args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+        case "$args" in
+            *fake-xray*|*fake-ocvpn*) kill "$pid" 2>/dev/null || true ;;
+        esac
+    done < <(pgrep -f "$1" 2>/dev/null || true)
+}
+_kill_matching9() {
+    local pid args
+    while IFS= read -r pid; do
+        [[ -z "$pid" || "$pid" == "$$" ]] && continue
+        args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+        case "$args" in
+            *fake-xray*|*fake-ocvpn*) kill -9 "$pid" 2>/dev/null || true ;;
+        esac
+    done < <(pgrep -f "$1" 2>/dev/null || true)
+}
+
 no_cleanup
 
 # --- изолированные пути/состояние ---
@@ -62,6 +88,7 @@ OPENCODE_LOG="$WORK/opencode.log"; : > "$OPENCODE_LOG"
 OCVPN_LOG="$WORK/ocvpn.log"
 PF_CONF="$WORK/pf.conf"; : > "$PF_CONF"
 PF_ANCHOR_FILE="$WORK/pf.anchor"
+HOSTS_FILE="$WORK/hosts"; printf '# test hosts\n' > "$HOSTS_FILE"
 export OCVPN_STATE_DIR
 
 # Повторно сорсим реальный скрипт (guard не даёт main) и заново изолируем пути —
@@ -83,6 +110,7 @@ restore_env() {
     OCVPN_LOG="$WORK/ocvpn.log"
     PF_CONF="$WORK/pf.conf"
     PF_ANCHOR_FILE="$WORK/pf.anchor"
+    HOSTS_FILE="$WORK/hosts"
     set +e
 }
 
@@ -112,6 +140,17 @@ check_true "stop_all убил holder" bash -c "! kill -0 $FH 2>/dev/null"
 check_true "stop_all убил xray" bash -c "! kill -0 $FX 2>/dev/null"
 check_true "stop_all удалил active.env" test ! -f "$ACTIVE_FILE"
 
+echo "=== [B2] SAFETY: хостовые xray/ocvpn выживают после stop_all ==="
+exec -a 'xray run -c /tmp/opencode-vpn/REAL/config.json' /bin/sleep 37 & DEC=$!
+printf '#!/bin/bash\nsleep 37\n' > "$WORK/host-like-ocvpn"; chmod +x "$WORK/host-like-ocvpn"
+bash "$WORK/host-like-ocvpn" & DECH=$!
+sleep 0.3
+stop_all
+sleep 0.3
+check_true "хостовый xray НЕ убит" bash -c "kill -0 $DEC 2>/dev/null"
+check_true "хостовый ocvpn НЕ убит" bash -c "kill -0 $DECH 2>/dev/null"
+kill -9 "$DEC" "$DECH" 2>/dev/null || true
+
 echo "=== [C] resolve_ipv4 (darwin/linux, fallback) ==="
 dscacheutil() { printf 'name: x\nip_address: 93.184.216.34\n'; }
 dig() { echo "1.2.3.4"; }
@@ -136,21 +175,15 @@ resolve_ipv4() { case "$1" in a) echo 1.1.1.1; echo 2.2.2.2;; b) echo 2.2.2.2;; 
 OPENCODE_DOMAINS=("a" "b")
 check "resolve_domains dedup" "$(printf '1.1.1.1\n2.2.2.2')" "$(resolve_domains)"
 
-echo "=== [E] hosts_setup/hosts_cleanup (только если /etc/hosts писаем) ==="
-if [[ -w /etc/hosts ]]; then
-    cp /etc/hosts "$WORK/hosts.bak"
-    OPENCODE_DOMAINS=("stub.example")
-    resolve_ipv4() { echo 93.184.216.34; }
-    hosts_setup >/dev/null 2>&1
-    check_true "hosts_setup добавил" bash -c "grep -q 'opencode-vpn' /etc/hosts"
-    hosts_setup >/dev/null 2>&1
-    check "hosts_setup идемпотентен" 1 "$(grep -c 'stub.example' /etc/hosts)"
-    hosts_cleanup >/dev/null 2>&1
-    check "hosts_cleanup убрал" 0 "$(grep -c 'opencode-vpn' /etc/hosts || true)"
-    cp "$WORK/hosts.bak" /etc/hosts
-else
-    echo "  (пропуск: /etc/hosts не писаем)"
-fi
+echo "=== [E] hosts_setup/hosts_cleanup (изолированный HOSTS_FILE) ==="
+OPENCODE_DOMAINS=("stub.example")
+resolve_ipv4() { echo 93.184.216.34; }
+hosts_setup >/dev/null 2>&1
+check_true "hosts_setup добавил" bash -c "grep -q 'opencode-vpn' '$HOSTS_FILE'"
+hosts_setup >/dev/null 2>&1
+check "hosts_setup идемпотентен" 1 "$(grep -c 'stub.example' "$HOSTS_FILE")"
+hosts_cleanup >/dev/null 2>&1
+check "hosts_cleanup убрал" 0 "$(grep -c 'opencode-vpn' "$HOSTS_FILE" || true)"
 
 echo "=== [F] pf: anchor/refs/remove/dispatch ==="
 resolve_domains() { printf '1.1.1.1\n2.2.2.2\n'; }
@@ -422,12 +455,11 @@ check_true "_spawn без setsid" bash -c "grep -q hi '$WORK/spawn2.log'"
 check "shuffle fallback" "3" "$(cat "$WORK/shuf_out")"
 # SUBS_URL из ~/.ocvpn-subs-url
 mkdir -p "$WORK/h1"; echo "https://h1/sub" > "$WORK/h1/.ocvpn-subs-url"
-check "SUBS_URL из файла" "https://h1/sub" "$(HOME="$WORK/h1" bash -c 'source "$1"; echo "$SUBS_URL"' _ "$SCRIPT")"
-# SUBS_URL из /etc/ocvpn/subs-url
-if mkdir -p /etc/ocvpn 2>/dev/null && printf 'https://sys/sub' > /etc/ocvpn/subs-url 2>/dev/null; then
-    mkdir -p "$WORK/h2"
-    check "SUBS_URL из /etc" "https://sys/sub" "$(HOME="$WORK/h2" bash -c 'source "$1"; echo "$SUBS_URL"' _ "$SCRIPT")"
-fi
+check "SUBS_URL из файла" "https://h1/sub" "$(HOME="$WORK/h1" env -u BASH_ENV -u OCVPN_TRACE_FILE bash -c 'source "$1"; echo "$SUBS_URL"' _ "$SCRIPT")"
+# SUBS_URL из системного файла (путь переопределяем, чтобы не трогать /etc)
+mkdir -p "$WORK/h2"
+printf 'https://sys/sub' > "$WORK/sys-subs-url"
+check "SUBS_URL из /etc" "https://sys/sub" "$(HOME="$WORK/h2" OCVPN_SYS_SUBS_FILE="$WORK/sys-subs-url" env -u BASH_ENV -u OCVPN_TRACE_FILE bash -c 'source "$1"; echo "$SUBS_URL"' _ "$SCRIPT")"
 
 # find_xray: установка для разных арх + ошибки
 curl() {
@@ -633,6 +665,12 @@ printf 'vless://u1@a:443?security=none&type=tcp#A\n' > "$WORK/m_a.txt"
 printf 'vless://u2@c:443?security=none&type=tcp#C\n%s\n' "$WORK/m_a.txt" > "$WORK/m_list.txt"
 OCVPN_SUBS_FILE="$WORK/m_list.txt" download_subscription "$WORK/m_out.txt" >/dev/null 2>&1
 check "multi-source count" "2" "$(grep -c . "$WORK/m_out.txt")"
+
+echo "=== [ZH] HOME default (systemd без HOME) ==="
+check "HOME default при пустом HOME" "/root" \
+    "$(env -u HOME env -u BASH_ENV -u OCVPN_TRACE_FILE bash -c 'source "$1"; printf "%s" "$HOME"' _ "$SCRIPT" 2>/dev/null)"
+check "HOME default не перебивает заданный" "$WORK/nohome" \
+    "$(HOME="$WORK/nohome" env -u BASH_ENV -u OCVPN_TRACE_FILE bash -c 'source "$1"; printf "%s" "$HOME"' _ "$SCRIPT" 2>/dev/null)"
 
 echo "=== [X] main-ветки (subshell, со стабами) ==="
 restore_env
