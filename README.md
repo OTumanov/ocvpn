@@ -1,140 +1,161 @@
 # ocvpn
 
-Прозрачная маршрутизация эндпоинтов [opencode](https://opencode.ai) и подключённых провайдеров моделей через VLESS-VPN. Весь остальной трафик хоста не затрагивается.
+Прозрачная маршрутизация эндпоинтов [opencode](https://opencode.ai) и провайдеров
+моделей через VLESS-VPN. Весь остальной трафик хоста не затрагивается.
 
-**v1.5.5:** команда `/ocvpn` в opencode (меню: статус, смена IP, подписка, свой
-хост `--add-host`/`--rm-host`/`--hosts`, старт/стоп, очистка) и её авто-регистрация
-при установке; детект/предложение установки opencode (`--ensure-opencode`);
-сброс активных соединений при смене IP (`ss -K`/`pfctl -K`) — новый IP применяется
-сразу, без перезапуска; фикс `HOME` под systemd; в обход добавлены openrouter,
-ChatGPT/OpenAI, Gemini, Grok и пользовательские домены; покрытие тестами ≥95%
-(+ исправленные баги: валидация vless, Host для ws, декод alpn trojan,
-url_host_port без userinfo, потеря stderr, дубли хостов).
-**v1.4.0:** нативный GUI на SwiftUI вместо tkinter (системный Tk 8.5 тёк по памяти):
-секции «Состояние» / «Подписка» / «Логи», видимое поле URL + «Сохранить»,
-«Новый IP», ошибки с текстом, вся блокировка в фоне, лог читается хвостом
-(не целым файлом). `install.sh` собирает `.app` на маке (нужен Xcode CLT),
-снимает карантин и ad-hoc подписывает. Python-GUI оставлен запасным.
-**v1.3.6:** GUI перерисовано (Operate): секции «Состояние» / «Подписка» / «Логи»,
-видимое поле ввода URL подписки + «Сохранить» инлайн (без popup), сохранение
-сразу и в файл, и системно; длинные строки переносятся, окно 580×660.
-**v1.3.5:** фикс по логу 1.3.4 (`main thread is not in main loop`): на Tk 8.5 из фонового
-потока нельзя даже `after()` — результат команд идёт через очередь + `event_generate`,
-защита `_tick` от гонки с закрытием окна; GUI пробрасывает `OCVPN_SUBS_URL` из своего
-env прямо в admin-команду; статус подписки честный (env GUI root не видит).
-**v1.3.4:** фикс «ввёл пароль — ничего не происходит»: admin-команды GUI выполняются
-в фоновом потоке (окно больше не виснет), каждое действие пишется в лог GUI,
-ошибки показываются диалогом; системная подписка `/etc/ocvpn/subs-url`
-(backend под root из osascript не видит env терминала и `~` пользователя) +
-кнопка «Подписка» в GUI сохраняет URL туда; `install.sh` сохраняет
-`OCVPN_SUBS_URL` из окружения установки.
-**v1.3.3:** GUI macOS: виджеты переведены на классические `tk.*` — системный Tk 8.5 от Apple не
-рисует ttk (белое окно без кнопок), теперь всегда рисуются; лог старта пишется всегда
-(`~/Library/Logs/ocvpn-gui.log`); принудительная отрисовка/активация окна; отключён
-Tk DEPRECATION warning.
-**v1.3.2:** GUI macOS: понятные
-диалоги в лаунчере при отсутствии python3/tkinter, лог ошибок `~/Library/Logs/ocvpn-gui.log`.
-**v1.3.1:** фикс macOS-инсталлятора (поиск `ocvpn.sh` рядом с `install.sh` — заработал из распакованного архива).
-**v1.3.0:** запуск в фоне (`--daemon`, терминал свободен), вотчдог лимитов — сам ловит
-IP-лимиты opencode/zen/go в логе opencode и переключается на ключ с **другим**
-exit IP, исчерпанные IP уходят в карантин. При подключении **проверяется
-доступность моделей opencode из региона**: если все free-модели отдают
-геоблок — exit IP в карантин на 12 ч. `--restart` (новый ключ в фоне),
-`--new-ip` (сменить IP сейчас), `--subs URL|ФАЙЛ` (разовый источник ключей).
-Для macOS есть GUI: одна кнопка + логи + авторотация.
+**Текущая версия: v1.5.5.**
+
+## Что нового в v1.5.5
+
+- **Команда `/ocvpn` в opencode** (`~/.config/opencode/commands/ocvpn.md`) — меню:
+  статус, смена IP, подписка, **свой хост** (`--add-host` / `--rm-host` / `--hosts`),
+  старт/стоп, очистка. Ставится автоматически инсталляторами
+  (`--install-opencode-command`) + детект/предложение установки opencode
+  (`--ensure-opencode`).
+- **Свои домены через VPN** — `ocvpn --add-host example.com`. Список в
+  `~/.config/ocvpn/hosts`, применяется сразу на активном соединении.
+- **Сброс активных соединений при активации** (`ss -K` / `pfctl -K`) — новый exit IP
+  применяется сразу, без «подождать, пока отвалится сам». Без root — подсказка
+  перезапустить opencode.
+- В обход добавлены **OpenRouter, ChatGPT/OpenAI, Gemini, Grok/xAI** (плюс
+  пользовательские домены).
+- **Фикс `HOME` под systemd** — сервис больше не падает с `HOME: unbound variable`
+  и не чистит xray у ручного запуска.
+- **Покрытие тестами ≥95%** (по факту 96%) и исправленные по их результатам баги:
+  валидация `vless://`, `Host` для ws, декод `alpn` у trojan, `url_host_port` без
+  userinfo, потеря stderr, дубли при `--add-host`, устаревшие записи в `/etc/hosts`.
+
+<details>
+<summary>История (v1.4.0 и ранее)</summary>
+
+- **v1.4.0** — нативный SwiftUI-GUI вместо tkinter (Tk 8.5 тёк по памяти): секции
+  «Состояние» / «Подписка» / «Логи», поле URL + «Сохранить», «Новый IP», блокировка
+  в фоне, чтение лога хвостом.
+- **v1.3.0** — `--daemon`, вотчдог лимитов (сам ротирует IP), гео-чек моделей,
+  карантин, `--restart` / `--new-ip` / `--subs`, macOS-GUI.
+- **v1.3.1–v1.3.6** — доработки macOS-GUI и инсталлятора.
+
+</details>
 
 ## Зачем
 
-free-тариф opencode лимитирует по IP (без device_id). Смена IP сбрасывает лимиты. Скрипт каждый запуск выбирает случайный рабочий сервер из твоей подписки — новый выходной IP.
+Free-тариф opencode/zen/go лимитируется **по IP**. Смена выходного IP сбрасывает
+лимит. ocvpn при каждом запуске выбирает случайный рабочий сервер из подписки —
+новый выходной IP — и заворачивает через него **только** трафик к эндпоинтам
+opencode и провайдеров.
 
 ## Как работает
 
-1. Скачивает подписку с VLESS-ключами (plain-text и **base64** — V2Board/Marzban)
-2. Берёт `BATCH_SIZE` случайных поддерживаемых серверов, параллельно пингует (TCP-connect)
-3. `MAX_TRIES` лучших по пингу — кандидаты; пробует реальное подключение через xray (HTTP 204 на `google.com/generate_204`)
-4. Первый рабочий ключ → прозрачный прокси (iptables REDIRECT)
-5. **Только** трафик к эндпоинтам opencode и провайдеров на порту 443 идёт через VPN
-6. Всё остальное на хосте — напрямую
+1. Скачивает подписку с ключами (plain-text и **base64**, V2Board/Marzban).
+2. Берёт `BATCH_SIZE` случайных поддерживаемых серверов, параллельно пингует (TCP-connect).
+3. `MAX_TRIES` лучших по пингу — кандидаты; пробует реальное подключение через xray
+   (`HTTP 204` на `google.com/generate_204`).
+4. Первый рабочий ключ → прозрачный прокси (`iptables nat OUTPUT` / macOS `pf rdr`).
+5. **Сбрасывает уже открытые соединения** к эндпоинтам (`ss -K` / `pfctl -K`), чтобы
+   новый IP подхватился немедленно.
+6. **Только** трафик к эндпоинтам из списка на порту 443 идёт через VPN, всё
+   остальное — напрямую.
 
-Каждый запуск = новая случайная выборка → новый ключ → новый выходной IP.
+Каждый запуск = новая случайная выборка → новый ключ → новый exit IP.
 
-## Эндпоинты (v1.18.30)
+## Эндпоинты
 
-Список определён анализом исходников `sst/opencode` v1.18.30. Все домены прибиваются в `/etc/hosts` (форсировка IPv4, отключение AAAA) и попадают в цепочку iptables NAT REDIRECT → xray → VPN.
+Домены форсируются в `/etc/hosts` (IPv4, без AAAA) и попадают в цепочку iptables
+NAT `REDIRECT` → xray → VPN. По умолчанию туннелируются:
 
-### Инфраструктура OpenCode
+**Инфраструктура opencode:** `opencode.ai` (auth/console, Zen `/zen/v1`, Go
+`/zen/go/v1`), `api.opencode.ai`, `models.opencode.ai`, `app.opencode.ai`, `opncd.ai`.
 
-| Домен | Назначение |
+**Провайдеры моделей:**
+
+| Провайдер | Домены |
 |---|---|
-| `opencode.ai` | console auth (`/console/auth/device/code\|token`), remote-config (`/console/api/config\|user\|orgs`), **Zen API** (`/zen/v1`), **Go API** (`/zen/go/v1`), changelog, config schema |
-| `models.opencode.ai` | каталог моделей (`/api.json`, загружается при старте, TTL 5 мин) |
-| `api.opencode.ai` | интеграция GitHub App |
-| `app.opencode.ai` | upstream веб-UI сервера |
-| `opncd.ai` | сервис share (публикация сессий) |
+| OpenRouter | `openrouter.ai`, `www.openrouter.ai` |
+| OpenAI / ChatGPT | `api.openai.com`, `chatgpt.com`, `chat.openai.com`, `platform.openai.com`, `auth.openai.com` |
+| Google Gemini | `generativelanguage.googleapis.com`, `gemini.google.com`, `aistudio.google.com`, `ai.google.dev` |
+| xAI / Grok | `api.x.ai`, `grok.com`, `x.ai` |
+| ZenMux | `zenmux.ai` |
 
-### Провайдеры моделей
+> **Не** туннелируются (ходят напрямую, `DIRECT`): `api.deepseek.com`, `ollama.com`,
+> `api.ollama.com`.
 
-Провайдеры определяются из `~/.local/share/opencode/auth.json`. Скрипт туннелирует все настроенные:
+### Свой хост
 
-| Провайдер | Домен(ы) |
-|---|---|
-| `opencode` | `opencode.ai` (Zen) |
-| `opencode-go` | `opencode.ai` (Go) |
-| `deepseek` | `api.deepseek.com` |
-| `ollama-cloud` | `ollama.com`, `api.ollama.com` |
-| `openrouter` | `openrouter.ai` |
-| `zenmux` | `zenmux.ai` |
-| OpenAI (OAuth) | `auth.openai.com` |
+Любой домен можно добавить в обход через VPN (сохраняется в
+`~/.config/ocvpn/hosts`, применяется сразу, если VPN активен):
 
-> Если добавишь нового провайдера (Anthropic, xAI, Groq и т.д.), его домен нужно будет вручную добавить в `OPENCODE_DOMAINS` в начале скрипта.
+```bash
+ocvpn --add-host example.com   # завести домен через VPN
+ocvpn --hosts                  # показать итоговый список доменов
+ocvpn --rm-host example.com    # убрать домен
+```
+
+Часть CLI из `/ocvpn` в opencode: просто напиши «добавь example.com через впн».
 
 ## Быстрый старт
 
 ```bash
 git clone git@github.com:OTumanov/ocvpn.git
 cd ocvpn
-ocvpn --daemon          # в фон, терминал свободен (лог /var/log/ocvpn.log)
+ocvpn --daemon          # в фон (лог ~/.local/share/ocvpn/ocvpn.log)
 ocvpn --daemon --watch  # фон + вотчдог: сам ловит лимиты и ротирует IP
 ocvpn --new-ip          # сменить exit IP сейчас
-ocvpn --restart         # перезапустить в фоне: новый ключ + (обычно) новый IP
-ocvpn --subs https://… # разовый источник ключей (URL подписки или txt с vless://)
+ocvpn --restart         # перезапустить в фоне: новый ключ (+ обычно новый IP)
+ocvpn --subs https://…  # разовый источник ключей (URL подписки или txt с vless://)
 ```
 
 На macOS — GUI: распаковать `dist/ocvpn-*-macos.tar.gz`, `sudo ./install.sh`,
-открыть `/Applications/OCVPN.app`: одна кнопка + логи + чекбокс авторотации.
+открыть `/Applications/OCVPN.app`.
 
-Скрипт автоматически:
-- Установит xray (если не найден) в `~/.local/opt/xray`
-- Скачает список ключей
-- Найдёт рабочий сервер
-- Поднимет прозрачный прокси
+Скрипт автоматически установит xray (если нет) в `~/.local/opt/xray`, скачает
+ключи, найдёт рабочий сервер и поднимет прокси.
 
-**После успешного запуска** — открой новую сессию/вкладку и запусти `opencode`. Маршрутизация работает на уровне ядра (iptables nat), переменные окружения не нужны.
+**После запуска** открой сессию opencode. Маршрутизация — на уровне ядра, env не нужны.
 
-> Важно: скрипт должен быть запущен **до** opencode. `iptables nat OUTPUT` перехватывает только новые TCP-соединения. Если opencode уже запущен до скрипта — его существующие соединения останутся прямыми.
+> Скрипт запускай **до** opencode: `iptables nat OUTPUT` ловит только новые
+> TCP-соединения. Если opencode уже работал до подключения — при смене IP сброс
+> соединений (`ss -K`) применяется автоматически; при первом подключении просто
+> перезапусти opencode один раз.
+
+## Команда `/ocvpn` в opencode
+
+Инсталляторы ставят команду сами. Вручную:
+
+```bash
+ocvpn --install-opencode-command   # положить ~/.config/opencode/commands/ocvpn.md
+ocvpn --ensure-opencode auto       # найти opencode; если нет — предложить установку
+```
+
+После установки в opencode появится `/ocvpn` (нужен перезапуск opencode — команды
+читаются при старте). Команда показывает статус и предлагает меню.
+
+Для LLM-агентов есть [`AGENTS.md`](AGENTS.md) — пошаговая инструкция установки.
 
 ## Команды
 
 | Команда | Описание |
 |---------|----------|
 | `ocvpn` | Запустить VPN в foreground (Ctrl-C = стоп + cleanup) |
-| `ocvpn --daemon [--watch]` | Запустить в фоне, терминал свободен (лог `/var/log/ocvpn.log`) |
-| `ocvpn --watch` | Вотчдог: следит за логом opencode, ловит IP-лимиты, дёргает `--rotate` |
-| `ocvpn --new-ip` | Сменить exit IP сейчас (сигнал держателю) |
-| `ocvpn --rotate [why]` | То же, что `--new-ip` (алиас) |
-| `ocvpn --restart` | Перезапустить в фоне: прибить держателя, поднять новый ключ + (обычно) новый IP |
+| `ocvpn --daemon [--watch]` | Запустить в фоне, терминал свободен |
+| `ocvpn --watch` | Вотчдог: следит за логом opencode, ловит IP-лимиты, ротирует |
+| `ocvpn --new-ip` / `--rotate [why]` | Сменить exit IP сейчас (новый применяется сразу) |
+| `ocvpn --restart` | Перезапустить в фоне: новый ключ (+ обычно новый IP) |
 | `ocvpn --status` | Состояние: xray, порты, маршруты, ключ, exit IP, карантин, вотчдог |
-| `ocvpn --cleanup` | Снять iptables/pf-правила, убрать форсировку IPv4 из `/etc/hosts` |
+| `ocvpn --cleanup` | Снять маршруты и убрать IPv4-записи из `/etc/hosts` |
+| `ocvpn --add-host ДОМЕН` | Добавить свой домен в обход через VPN (сразу, если активен) |
+| `ocvpn --rm-host ДОМЕН` | Убрать домен из пользовательского списка |
+| `ocvpn --hosts` | Показать итоговый список доменов (встроенные + свои) |
+| `ocvpn --install-opencode-command` | Установить команду `/ocvpn` в конфиг opencode |
+| `ocvpn --ensure-opencode [auto\|yes\|no]` | Найти opencode; если нет — предложить установку |
 
-`--subs URL|ФАЙЛ` можно передать в любом месте командной строки — это разовый
-источник ключей для запуска/рестарта: URL подписки или готовый txt с `vless://`
-(например `ocvpn --subs https://provider/sub --restart`). Постоянный источник —
-`OCVPN_SUBS_URL`/`~/.ocvpn-subs-url` (см. «Подписка»).
+`--subs URL|ФАЙЛ` можно передать в любом месте командной строки — разовый источник
+ключей (URL подписки или готовый txt с `vless://`), например
+`ocvpn --subs https://provider/sub --restart`.
 
 ## Вотчдог лимитов и ротация
 
-Free-tier opencode/zen/go лимитируется **по IP**: смена выходного IP сбрасывает лимит.
-Вотчдог (`ocvpn --watch`, обычно вместе с `--daemon`) хвостом читает лог opencode
+Free-tier opencode/zen/go лимитируется **по IP**: смена exit IP сбрасывает лимит.
+Вотчдог (`ocvpn --watch`, обычно с `--daemon`) хвостом читает лог opencode
 (`~/.local/share/opencode/log/opencode.log`) и при строках вида:
 
 - `AI_APICallError: Rate limit exceeded. Please try again later.`
@@ -142,106 +163,94 @@ Free-tier opencode/zen/go лимитируется **по IP**: смена вы�
 - `… usage limit reached. It will reset in N minutes/hours …`
 - `Too many requests` / `429` от zen
 
-шлёт держателю сигнал — тот кладёт исчерпанный IP в карантин и поднимает ключ
-с **другим** exit IP. Старый ключ гасится только после проверки нового — обрыва нет.
-Новый opencode-переподключать не надо: `iptables nat OUTPUT` / `pf rdr` ловят только
-новые соединения, следующие запросы сами уйдут через новый IP (in-flight запрос упадёт).
+шлёт держателю сигнал — тот кладёт исчерпанный IP в карантин и поднимает ключ с
+**другим** exit IP. Старый ключ гасится только после проверки нового — обрыва нет.
+Существующие соединения не переоткрываются сами по себе, но при активации нового
+ключа ocvpn сбрасывает установленные сокеты к эндпоинтам (`ss -K` / `pfctl -K`),
+так что новый IP применяется сразу (нужен root; без root — перезапусти opencode).
 
-**Не триггерят** (смена IP не поможет, ollama вообще игнорируется):
-
-- `ollama.com/upgrade`, `ollama.com/settings` — лимиты аккаунта ollama
-- `Insufficient balance`, `/billing` — деньги, а не IP
-- `not available in your country` — геоблок
-- `Forbidden`, `Model is disabled`, `Cannot connect`, `Task cancelled`
+**Не триггерят** (смена IP не поможет): `ollama.com/upgrade`, `/settings`
+(лимиты аккаунта ollama), `Insufficient balance`/`/billing` (деньги),
+`not available in your country` (геоблок), `Forbidden`, `Model is disabled`,
+`Cannot connect`, `Task cancelled`.
 
 Защита от флэппинга: cooldown 600 сек (`OCVPN_ROTATE_COOLDOWN`) + максимум 6 ротаций
 в час (`OCVPN_ROTATE_MAX_PER_HOUR`).
 
 ## Geo-check: доступность моделей из региона
 
-При каждом подключении/ротации проверяется, что из текущего exit IP **действительно
-доступны модели opencode** (геоблок детектится не по IP-гео, а по ответу API).
-`check_model_available()` пробует 5 free-моделей через `api.opencode.ai`
-(SOCKS-прокси ropического ключа):
+При подключении/ротации проверяется, что из текущего exit IP **доступны модели
+opencode** (геоблок детектится не по IP-гео, а по ответу API).
+`check_model_available()` пробует 5 free-моделей через `api.opencode.ai`:
 
-- HTTP **200/201/429** — модель отвечает → регион рабочий → подключение принято
-- HTTP **403/451** (или geo-паттерн в ответе) — геоблок модели
-- **500/timeout** — трактуется как «неизвестно», не карантинится (не хочется
-  убивать рабочие IP из-за шума сети)
+- HTTP **200/201/429** — модель отвечает → регион рабочий;
+- HTTP **403/451** (или geo-паттерн в ответе) — геоблок;
+- **500/timeout** — «неизвестно», не карантинится (шум сети).
 
-Если **все** free-модели вернули геоблок — exit IP бесполезен: ключ уходит в
-карантин на **12 часов** (`geo-block: модели не доступны из региона`),
-подключение отменяется и пробуется следующий кандидат. Достаточно одной
-доступной модели, чтобы IP приняли за рабочий.
+Если **все** free-модели отдали геоблок — exit IP в карантин на **12 часов**,
+подключение отменяется и пробуется следующий кандидат.
 
 ## Карантин
 
-Исчерпанный сервер (`host:port`) и его exit IP помечаются и не выбираются до истечения
-срока. Сколько часов — по хинту из строки лимита (`reset in N minutes/hours/days`,
-проверено по исходникам opencode: фиксированного N там нет, сервер присылает
-динамический reset через `x-ratelimit-reset`/`retry-after`, клиент показывает
-«Usage limit reached. It will reset in …»). Нет хинта — дефолт 6 часов
-(`OCVPN_QUARANTINE_HOURS`), потолок 168. Гео-заблокированные IP (все free-модели
-недоступны) карантинятся на **12 часов** с reason `geo-block: модели не доступны
-из региона`. Хранилище: `~/.local/share/ocvpn/quarantine.tsv`.
+Исчерпанный сервер (`host:port`) и его exit IP не выбираются до истечения срока.
+Число часов — по хинту из строки лимита (`reset in N minutes/hours/days`). Нет
+хинта — дефолт 6 часов (`OCVPN_QUARANTINE_HOURS`), потолок 168.
+Гео-заблокированные IP — 12 часов (`geo-block: модели не доступны из региона`).
+Хранилище: `~/.local/share/ocvpn/quarantine.tsv`.
 
 ## Проверка, что VPN работает
 
 ```bash
-# 1. Exit IP через SOCKS5 прокси (должен отличаться от прямого)
-curl -s https://ipinfo.io/ip                            # IP хоста
-curl -s --proxy socks5h://127.0.0.1:10808 https://ipinfo.io/ip   # IP через VPN
+# 1. Exit IP через SOCKS5 (должен отличаться от прямого)
+curl -s https://ipinfo.io/ip
+curl -s --proxy socks5h://127.0.0.1:10808 https://ipinfo.io/ip
 
-# 2. Проверить, что конкретный эндпоинт идёт через туннель
-#    (счётчик в iptables растёт)
-iptables -t nat -L OPENCODE_VPN -n -v | grep 172.65.90.20  # opencode.ai
-curl -s -o /dev/null https://opencode.ai/ && iptables -t nat -L OPENCODE_VPN -n -v | grep 172.65.90.20
+# 2. Счётчик маршрута растёт
+iptables -t nat -L OPENCODE_VPN -n -v | grep 172.65.90.20   # opencode.ai
 
-# 3. Проверить, что opencode видит туннель (ss покажет соединение opencode → IP в списке)
+# 3. opencode видит туннель
 ss -tnp | grep opencode
-# Должно быть: opencode → 172.65.90.20:443 (opencode.ai) или 3.173.21.63:443 (deepseek)
 ```
 
 ## Тесты
 
 ```bash
-bash ocvpn-tests.sh    # ожидается PASS=59 FAIL=0
+bash ocvpn-tests.sh      # функциональные: ожидается PASS=70 FAIL=0
+bash tests/coverage.sh   # покрытийные + гейт OCVPN_COV_MIN (по умолчанию 95)
 ```
 
- Покрывает:
-- Парсинг всех типов VLESS-конфигов (reality, ws, tls, grpc, xhttp)
-- Декодирование URL-encoded параметров (path, sni)
-- Xray 26: `xhttpSettings` (host строкой, mode), а не устаревший `httpSettings`
-- Логику отбора кандидатов (TCP-пинг, сортировка, отбрасывание мёртвых)
-- Фильтр поддерживаемых ключей (`is_supported_key`)
-- Индемпотентность `/etc/hosts` (не плодит дубликаты при повторных запусках)
-- Парсинг 5 реальных ключей из живой подписки
-- CLI (`--help/--version/--status`) и macOS-ветку (резолв, pf-якорь, диспетчер — на стабах)
-- Вотчдог: 15 +/-кейсов лимитов (zen/console — да; ollama/биллинг/гео/сеть — нет)
-- Парсинг `reset in N` → часы карантина (мин/часы/дни, дефолт, потолок 168)
-- Карантин: блок host:port и exit IP, expiry, count
-- Регрессия EXIT-trap: `--help/--version/--status` не пишут в iptables и не трогают `/etc/hosts`
-- `--new-ip` без держателя: чистая ошибка без побочек; `--help` анонсирует новые флаги
-- `parse_subs_flag`: файл / http(s)-URL / флаг после команды / мусор / пусто
-- `download_subscription`: с vless-ключами / нет файла / нет vless
-- Geo-check: наличие `check_model_available`/`FREE_MODELS`/`GEO_BLOCK_PATTERNS`,
-  карантин geo-заблокированного IP, пустой `auth.json` → пропуск проверки
+`tests/coverage.sh` прогоняет `ocvpn-coverage.sh` + кластеры `tests/cov-*.sh` под
+трассировкой и считает покрытие **исполняемых** строк `ocvpn.sh` (тела heredoc,
+структурные строки и многострочные литералы исключаются). Текущее покрытие —
+**96%** (`OCVPN_COV_LIST=1` печатает непокрытые строки). Порог: `OCVPN_COV_MIN=95`,
+при недоборе — код выхода 3.
+
+Кластеры: `cov-converters` (конвертеры протоколов), `cov-keys` (отбор/ротация),
+`cov-subs-routes` (подписки/маршруты/hosts), `cov-status` (CLI/статус/main),
+`cov-cli` (управление хостами), `cov-command` (`/ocvpn`, `--ensure-opencode`),
+`cov-edge` (граничные ветки), `cov-source` (top-level), `cov-regress` (регрессы
+исправленных багов), `cov-final`.
+
+> `tests/lib.sh` **жёстко изолирует** тесты: `iptables`/`pfctl`/`ss`/`ip`/`pkill`
+> заглушены, `HOME`/`/etc/hosts`/state — во временных файлах, а `_kill_matching`
+> убивает только тестовые фейки. Прогон тестов не влияет на рабочий VPN хоста.
 
 ## Установка пакетами
 
 ```bash
-make deb        # dist/ocvpn-1.3.2-all.deb  (Debian/Ubuntu, systemd-юнит ocvpn.service)
-make macos-tar  # dist/ocvpn-1.3.2-macos.tar.gz (macOS: ocvpn + OCVPN.app + LaunchDaemon)
+make deb        # dist/ocvpn-1.5.5-all.deb        (Debian/Ubuntu, systemd-юнит)
+make macos-tar  # dist/ocvpn-1.5.5-macos.tar.gz  (macOS: ocvpn + OCVPN.app + LaunchDaemon)
 ```
 
-Debian: `sudo dpkg -i dist/ocvpn-*.deb` (сервис включается, но не стартует сам —
-старт: `systemctl start ocvpn`). macOS: распаковать архив, `sudo ./install.sh`;
-`.pkg` собирается на самом Mac: `bash packaging/macos/build-pkg.sh`.
-Нативный SwiftUI-GUI: `bash gui-swift/build.sh` (только на Mac).
+Debian: `sudo dpkg -i dist/ocvpn-*.deb` — сервис **включается, но не стартует сам**
+(старт: `systemctl start ocvpn`); `postinst` ставит команду `/ocvpn` и вызывает
+`--ensure-opencode auto`. macOS: распаковать архив, `sudo ./install.sh`; `.pkg`
+собирается на самом Mac: `bash packaging/macos/build-pkg.sh`. SwiftUI-GUI:
+`bash gui-swift/build.sh` (только на Mac).
 
 ## Конфигурация
 
-Параметры в начале скрипта:
+Параметры в начале `ocvpn.sh`:
 
 ```bash
 BATCH_SIZE=10    # сколько случайных ключей пинговать
@@ -252,47 +261,45 @@ TIMEOUT=5        # таймаут теста generate_204 (сек)
 
 ### Список эндпоинтов
 
-Если нужно добавить/убрать домены — редактируй массив `OPENCODE_DOMAINS` в начале скрипта:
+Встроенный список — массив `OPENCODE_DOMAINS` в начале скрипта. Свои домены удобнее
+добавлять через `ocvpn --add-host` (файл `~/.config/ocvpn/hosts`), они подмешиваются
+к встроенным при старте.
 
-```bash
-OPENCODE_DOMAINS=(
-    # --- Инфраструктура OpenCode ---
-    "opencode.ai"
-    "api.opencode.ai"
-    "models.opencode.ai"
-    "app.opencode.ai"
-    "opncd.ai"
-    # --- Провайдеры моделей ---
-    "api.deepseek.com"
-    "ollama.com"
-    "api.ollama.com"
-    "openrouter.ai"
-    "zenmux.ai"
-    "auth.openai.com"
-)
-```
+При добавлении домена скрипт автоматически добавит IPv4-запись в `/etc/hosts`,
+зарезолвит IP и добавит `REDIRECT`; при `--cleanup` всё удалит.
 
-При добавлении домена скрипт автоматически:
-- Добавит IPv4-запись в `/etc/hosts` (форсировка IPv4)
-- Зарезолвит IP и добавит iptables REDIRECT правило
-- При `--cleanup` всё удалит
+### Переменные окружения
+
+| Переменная | Назначение |
+|---|---|
+| `OCVPN_SUBS_URL` | источник подписки (высший приоритет) |
+| `OCVPN_SUBS_FILE` | локальный файл с ключами/списком |
+| `OCVPN_SYS_SUBS_FILE` | системный файл подписки (по умолчанию `/etc/ocvpn/subs-url`) |
+| `OCVPN_USER_HOSTS_FILE` | файл своих доменов (по умолчанию `~/.config/ocvpn/hosts`) |
+| `OCVPN_HOSTS_FILE` | hosts-файл (по умолчанию `/etc/hosts`) |
+| `OCVPN_STATE_DIR` | каталог состояния (по умолчанию `~/.local/share/ocvpn`) |
+| `OCVPN_RESET_IPS` | явный список IP для сброса соединений (для тестов/скриптов) |
+| `OCVPN_OPENCODE_CMD_DIR` | каталог установки команды `/ocvpn` |
+| `OCVPN_OPENCODE_BIN` / `OCVPN_OPENCODE_INSTALL_CMD` | override детекта/установки opencode |
+| `OCVPN_COV_MIN` | порог покрытия в `tests/coverage.sh` (по умолчанию 95) |
 
 ## Подписка
 
-Поддерживаются plain-text и **base64** подписки (V2Board/Marzban). Приоритет URL:
+Поддерживаются plain-text и **base64** подписки. Приоритет источника:
 
-`--subs URL|ФАЙЛ` (разово, из командной строки) > `OCVPN_SUBS_URL` (env) >
-`~/.ocvpn-subs-url` (файл) > встроенный fallback-список.
-
-`--subs` с **файлом** берёт готовый txt с `vless://` без скачивания — удобно
-тестировать конкретную подписку.
+`--subs URL|ФАЙЛ` (разово) > `OCVPN_SUBS_URL` (env) > `~/.ocvpn-subs-url` (файл) >
+`/etc/ocvpn/subs-url` (системная) > встроенный публичный fallback.
 
 ```bash
-printf '%s\n' 'https://provider.example/sub/TOKEN' > ~/.ocvpn-subs-url
-chmod 600 ~/.ocvpn-subs-url
+# пользовательская
+printf '%s\n' 'https://provider.example/sub/TOKEN' > ~/.ocvpn-subs-url && chmod 600 ~/.ocvpn-subs-url
+# системная (для сервиса под root)
+sudo sh -c 'printf "%s\n" "<URL>" > /etc/ocvpn/subs-url && chmod 600 /etc/ocvpn/subs-url'
 ```
 
-Учитываются только ключи `vless://` типов `tcp`(raw)/`ws`/`grpc`/`xhttp`, которые умеет генерить xray-конфиг скрипта. Типы, которые xray не потянет (например sing-box xhttp packet-up с `extra=`), отфильтровываются.
+`--subs` с **файлом** берёт готовый txt с `vless://` без скачивания. Учитываются
+ключи `vless`/`vmess`/`trojan`/`ss`/`http(s)`/`socks` типов, которые умеет
+преобразовать генератор xray-конфига; неподдерживаемые отфильтровываются.
 
 ## Порты
 
@@ -302,31 +309,35 @@ chmod 600 ~/.ocvpn-subs-url
 | `10809` | HTTP прокси (localhost) |
 | `12345` | Прозрачный прокси (iptables REDIRECT) |
 
-SOCKS5 и HTTP прокси слушают только на `127.0.0.1` — наружу не публикуются. Прозрачный порт `12345` (dokodemo-door) слушает на всех интерфейсах, но трафик на него попадает только через iptables REDIRECT.
+SOCKS5/HTTP слушают только `127.0.0.1`. Порт `12345` (dokodemo-door) слушает на всех
+интерфейсах, но трафик на него попадает только через iptables REDIRECT.
 
 ## Ограничения и заметки
 
-- **Существующие соединения** — `iptables nat OUTPUT` перехватывает только новые TCP-соединения. Если opencode запущен до скрипта — его активные соединения останутся прямыми. Перезапусти opencode после скрипта.
-- **`owner --pid-owner`** — исключение трафика самого xray работает не на всех ядрах (iptables-nft). Если не поддержан — пропускается. Петли не будет, т.к. REDIRECT ловит только эндпоинты из списка, а xray ходит на IP VPN-сервера.
-- **Латентность** — трафик идёт через VPN-сервер (Россия/Казахстан и т.д.), задержка к эндпоинтам opencode увеличивается. Для проверки👃 это обычно не критично.
-- **Время жизни ключей** — ключи могут умирать. Если скрипт не находит рабочий — просто запусти ещё раз (выборка случайная).
-- **Нет IPv6** — скрипт принудительно форсирует IPv4 через `/etc/hosts`. Если на хосте есть глобальный IPv6 — трафик пойдёт через IPv4-записи из `/etc/hosts`.
-- **Коллатеральный трафик** — если домен из списка разделяет IP с другими сервисами (Cloudflare CDN), их трафик тоже попадёт в туннель. Обычно это не критично.
+- **Существующие соединения.** `iptables nat OUTPUT` ловит только новые соединения.
+  При активации нового ключа ocvpn сам сбрасывает уже открытые сокеты к эндпоинтам
+  (`ss -K` / `pfctl -K`, нужен root). Без root — перезапусти opencode.
+- **`owner --pid-owner`** — исключение трафика самого xray работает не на всех ядрах
+  (iptables-nft). Если не поддержано — пропускается; петли не будет, т.к. REDIRECT
+  ловит только эндпоинты из списка.
+- **Латентность** — трафик идёт через VPN-сервер, задержка к эндпоинтам растёт.
+- **Время жизни ключей** — ключи умирают; если рабочий не найден — запусти ещё раз.
+- **Нет IPv6** — принудительный IPv4 через `/etc/hosts`.
+- **Коллатеральный трафик** — домен из списка может делить IP с другими сервисами
+  (Cloudflare CDN); их трафик тоже пойдёт в туннель.
 
 ## Что не трогает
 
-- Nginx / проксируемые сайты (80, 443 входящие)
-- SSH (22)
-- Приватные подсети (10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12)
-- Docker-сети
-- Существующие TCP-соединения (iptables nat OUTPUT работает только на новые)
+- Nginx/проксируемые сайты (80/443 входящие), SSH (22)
+- Приватные подсети (`10/8`, `192.168/16`, `172.16/12`), Docker-сети
+- Трафик к провайдерам из «DIRECT» (deepseek, ollama)
 
 ## Зависимости
 
-- `curl`, `python3`, `unzip` + `iptables` (Linux) / `pfctl`, `dig` (macOS)
-- Рут (для iptables/pf и установки xray)
-- Linux (iptables REDIRECT) или macOS (pf rdr через якорь `com.otumanov.ocvpn`)
-- Ядро с поддержкой `owner` модуля iptables (рекомендуется; скрипт работает и без, но с небольшой оговоркой — смотрите раздел «Ограничения»)
+- `curl`, `python3`, `unzip`; Linux: `iptables` (+ `iproute2`/`ss` для сброса
+  соединений); macOS: `pfctl`, `dig`
+- Root — для iptables/pf, установки xray и сброса соединений `ss -K`
+- Linux (iptables REDIRECT) или macOS (pf rdr через якорь)
 
 ## Лицензия
 
