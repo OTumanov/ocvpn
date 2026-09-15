@@ -92,6 +92,43 @@ ocvpn --rm-host example.com    # убрать домен
 
 Часть CLI из `/ocvpn` в opencode: просто напиши «добавь example.com через впн».
 
+## Установка
+
+Три способа. После любого — команда `/ocvpn` в opencode (автоматически или
+`ocvpn --install-opencode-command`) и запуск сервиса/демона.
+
+### Через агента (opencode / LLM)
+
+Отдай агенту одну фразу — он прочитает [`AGENTS.md`](AGENTS.md) и всё поставит сам
+(ОС, права, пакет/скрипт, подписка, `/ocvpn`, проверка):
+
+```
+Установи ocvpn для этого хоста по инструкции:
+https://github.com/OTumanov/ocvpn/blob/main/AGENTS.md
+```
+
+### Вручную из исходников
+
+```bash
+git clone git@github.com:OTumanov/ocvpn.git
+cd ocvpn
+sudo cp ocvpn.sh /usr/local/bin/ocvpn && sudo chmod 755 /usr/local/bin/ocvpn
+sudo ocvpn --install-opencode-command   # команда /ocvpn в opencode
+sudo ocvpn --ensure-opencode auto       # детект/предложение установки opencode
+ocvpn --daemon --watch                  # поднять VPN в фоне с вотчдогом
+```
+
+### Пакетами
+
+```bash
+make deb        # dist/ocvpn-1.5.5-all.deb        (Debian/Ubuntu, systemd-юнит)
+make macos-tar  # dist/ocvpn-1.5.5-macos.tar.gz  (macOS: ocvpn + OCVPN.app + LaunchDaemon)
+```
+
+Debian: `sudo dpkg -i dist/ocvpn-*.deb` — сервис **включается, но не стартует сам**
+(старт: `systemctl start ocvpn`); `postinst` ставит `/ocvpn` и вызывает
+`--ensure-opencode auto`. macOS: распаковать архив, `sudo ./install.sh`.
+
 ## Быстрый старт
 
 ```bash
@@ -235,18 +272,11 @@ bash tests/coverage.sh   # покрытийные + гейт OCVPN_COV_MIN (по
 > заглушены, `HOME`/`/etc/hosts`/state — во временных файлах, а `_kill_matching`
 > убивает только тестовые фейки. Прогон тестов не влияет на рабочий VPN хоста.
 
-## Установка пакетами
+## Сборка пакетов
 
-```bash
-make deb        # dist/ocvpn-1.5.5-all.deb        (Debian/Ubuntu, systemd-юнит)
-make macos-tar  # dist/ocvpn-1.5.5-macos.tar.gz  (macOS: ocvpn + OCVPN.app + LaunchDaemon)
-```
-
-Debian: `sudo dpkg -i dist/ocvpn-*.deb` — сервис **включается, но не стартует сам**
-(старт: `systemctl start ocvpn`); `postinst` ставит команду `/ocvpn` и вызывает
-`--ensure-opencode auto`. macOS: распаковать архив, `sudo ./install.sh`; `.pkg`
-собирается на самом Mac: `bash packaging/macos/build-pkg.sh`. SwiftUI-GUI:
-`bash gui-swift/build.sh` (только на Mac).
+Команды сборки — см. раздел [«Установка»](#установка). Дополнительно:
+`.pkg` собирается на самом Mac (`bash packaging/macos/build-pkg.sh`),
+SwiftUI-GUI — `bash gui-swift/build.sh` (только на Mac).
 
 ## Конфигурация
 
