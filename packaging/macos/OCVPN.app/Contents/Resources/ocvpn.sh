@@ -5,7 +5,14 @@ set -euo pipefail
 # (в частности под sudo/systemd с урезанным PATH). Добавляем, не затирая остальное.
 export PATH="/usr/sbin:/sbin:$PATH"
 # systemd/launchd system-сервис не задаёт HOME — иначе set -u роняет скрипт.
-export HOME="${HOME:-/root}"
+# У macOS-рута дом /var/root (/root там не существует, а ФС только для чтения).
+if [[ -z "${HOME:-}" ]]; then
+    if [[ "$(uname -s 2>/dev/null || echo Linux)" == "Darwin" ]]; then
+        export HOME=/var/root
+    else
+        export HOME=/root
+    fi
+fi
 
 OCVPN_VERSION="1.5.5"
 # Linux (iptables REDIRECT) или macOS (pf rdr). Определяем один раз.
@@ -47,6 +54,12 @@ if [[ -z "$SUBS_URL" && -s "$HOME/.ocvpn-subs-url" ]]; then
 fi
 if [[ -z "$SUBS_URL" && -s "$SYS_SUBS_FILE" ]]; then
     SUBS_URL="$(head -n1 "$SYS_SUBS_FILE" 2>/dev/null | tr -d '[:space:]')"
+fi
+# Флаг нужен, чтобы не пугать предупреждением, когда пользователь явно указал
+# ту же ссылку, что и встроенный fallback.
+SUBS_FROM_FALLBACK=0
+if [[ -z "$SUBS_URL" ]]; then
+    SUBS_FROM_FALLBACK=1
 fi
 SUBS_URL="${SUBS_URL:-$SUBS_FALLBACK_URL}"
 # Схемы, которые умеет наш конвертер в xray-outbound.
@@ -1197,7 +1210,7 @@ _fetch_one_source() {
         fi
         if grep -qE "$SUPPORTED_RE" "$raw"; then
             cat "$raw"
-        elif base64 -d < "$raw" 2>/dev/null | grep -qE "$SUPPORTED_RE"; then
+        elif base64 -d < "$raw" 2>/dev/null | grep -E "$SUPPORTED_RE" >/dev/null; then
             base64 -d < "$raw"
         else
             # возможно, это текстовый файл со списком ссылок на подписки
@@ -2097,7 +2110,7 @@ do_status() {
     local rc=0
     echo "ocvpn $OCVPN_VERSION ($OCVPN_OS)"
     if pgrep -f "xray run" >/dev/null 2>&1; then
-        echo "xray: запущен ($(pgrep -cf "xray run") проц.)"
+        echo "xray: запущен ($(pgrep -f "xray run" | grep -c .) проц.)"
     else
         echo "xray: НЕ запущен"
         rc=1
@@ -2262,7 +2275,7 @@ main() {
         done
     fi
 
-    if [[ "$SUBS_URL" == "$SUBS_FALLBACK_URL" ]]; then
+    if [[ "$SUBS_FROM_FALLBACK" == 1 ]]; then
         warn "Подписка не задана — используется публичный fallback-источник (чужой). Своя: ~/.ocvpn-subs-url или системная /etc/ocvpn/subs-url"
     fi
     if [[ "${OCVPN_SUBS_FROM_FLAG:-}" == 1 ]]; then
