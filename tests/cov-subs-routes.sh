@@ -264,10 +264,15 @@ check "RETURN 192.168.0.0/16" "1" "$(grep -c -- '-d 192.168.0.0/16 -j RETURN' "$
 check "RETURN мультикаст" "1" "$(grep -c -- '-d 224.0.0.0/4 -j RETURN' "$IPT_CALLS")"
 check "REDIRECT на REDIRECT_PORT" "2" "$(grep -c -- "--dport 443 -j REDIRECT --to-ports $REDIRECT_PORT" "$IPT_CALLS")"
 check "OUTPUT подключён" "1" "$(grep -c -- '-A OUTPUT -p tcp -j OPENCODE_VPN' "$IPT_CALLS")"
-check "xray pid-owner правило" "1" "$(grep -c -- "--pid-owner $XRAY_PID -j RETURN" "$IPT_CALLS")"
+# pid-owner-ветка требует /proc (Linux); на macOS setup_routes_linux не используется.
+if [[ -r /proc/$$ ]]; then
+    check "xray pid-owner правило" "1" "$(grep -c -- "--pid-owner $XRAY_PID -j RETURN" "$IPT_CALLS")"
+fi
 check "hosts_setup вызван" "1" "$(grep -c '^hosts_setup$' "$IPT_CALLS")"
 ( setup_routes_linux >/dev/null 2>"$WORK/err_pidowner" )
-check_true "warn: pid-owner не поддержан" grep -q 'не поддержан' "$WORK/err_pidowner"
+if [[ -r /proc/$$ ]]; then
+    check_true "warn: pid-owner не поддержан" grep -q 'не поддержан' "$WORK/err_pidowner"
+fi
 
 iptables() {
     printf 'ipt %s\n' "$*" >> "$IPT_CALLS"
@@ -275,7 +280,9 @@ iptables() {
     return 0
 }
 out="$(setup_routes_linux 2>/dev/null)"
-check_true "pid-owner поддержан: залогирован" bash -c 'grep -q "исключён трафик самого xray" <<<"$1"' _ "$out"
+if [[ -r /proc/$$ ]]; then
+    check_true "pid-owner поддержан: залогирован" bash -c 'grep -q "исключён трафик самого xray" <<<"$1"' _ "$out"
+fi
 iptables() {
     printf 'ipt %s\n' "$*" >> "$IPT_CALLS"
     [[ "$*" == *"-S OUTPUT"* ]] && printf -- '-A OUTPUT -p tcp -j %s\n' "$IPTABLES_CHAIN"

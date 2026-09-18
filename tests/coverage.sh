@@ -6,13 +6,22 @@
 # Прогоняет ocvpn-coverage.sh + все tests/cov-*.sh под единым трейсом,
 # суммирует PASS/FAIL и проверяет порог OCVPN_COV_MIN (по умолчанию 95).
 set -uo pipefail
+# Покрытие требует BASH_XTRACEFD (bash >= 4.1). На стоковом macOS bash 3.2 —
+# трассировка в stderr теряется, покрытие получается заниженным.
+if [[ "${BASH_VERSINFO[0]:-0}" -lt 4 ]] \
+    || { [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]:-0}" -lt 1 ]]; }; then
+    echo "coverage.sh требует bash >= 4.1 (BASH_XTRACEFD)." >&2
+    echo "macOS: brew install bash && PATH=\"/opt/homebrew/bin:\$PATH\" bash tests/coverage.sh" >&2
+    exit 4
+fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 SRC="$REPO/ocvpn.sh"
 TRACE="$(mktemp)"
 LOG="$(mktemp)"
 SHIM="$(mktemp)"
-trap 'rm -f "$TRACE" "$LOG" "$SHIM"' EXIT
+PYSCRIPT="$(mktemp)"
+trap 'if [[ -n "${OCVPN_COV_KEEP:-}" ]]; then cp -f "$LOG" /tmp/ocvpn-cov-last.log 2>/dev/null || true; fi; rm -f "$TRACE" "$LOG" "$SHIM" "$PYSCRIPT"' EXIT
 
 cat > "$SHIM" <<'SHIM_EOF'
 if [[ -n "${OCVPN_TRACE_FILE:-}" ]]; then
@@ -37,8 +46,10 @@ for t in "${TESTS[@]}"; do
         echo ""
         echo "########## $name ##########"
     } >>"$LOG"
+    # bash < 4.1 (стоковый macOS) не умеет BASH_XTRACEFD — там `set -x` пишет
+    # в stderr, поэтому stderr теста идёт в трейс (на bash 4+ xtrace уже в fd19).
     OCVPN_TRACE_FILE="$TRACE" BASH_ENV="$SHIM" OCVPN_SCRIPT="$SRC" \
-        bash "$t" >>"$LOG" 2>&1
+        bash "$t" >>"$LOG" 2>>"$TRACE"
     rc=$?
     [[ $rc -ne 0 ]] && TOTAL_RC=1
     res="$(grep -E '^Итог: PASS=' "$LOG" | tail -1)"
@@ -49,7 +60,9 @@ SUM_PASS="$(grep -E '^Итог: PASS=' "$LOG" | sed -n 's/.*PASS=\([0-9]*\).*/\1
 SUM_FAIL="$(grep -E '^Итог: PASS=' "$LOG" | sed -n 's/.*FAIL=\([0-9]*\).*/\1/p' | awk '{s+=$1} END{print s+0}')"
 echo "Тесты суммарно: PASS=${SUM_PASS:-0} FAIL=${SUM_FAIL:-0}"
 
-COV_OUT="$(python3 - "$SRC" "$TRACE" <<'PY'
+# Python-скрипт пишем в файл: heredoc внутри "$(...)" не парсится bash 3.2
+# (стоковый macOS), из-за чего весь coverage.sh падал с syntax error.
+cat > "$PYSCRIPT" <<'PY'
 import sys, re, os
 src, trace = sys.argv[1], sys.argv[2]
 real = os.path.realpath(src)
@@ -164,7 +177,7 @@ if os.environ.get("OCVPN_COV_LIST"):
             if n <= len(src_lines):
                 print(f"{n}: {src_lines[n-1]}")
 PY
-)"
+COV_OUT="$(python3 "$PYSCRIPT" "$SRC" "$TRACE")"
 printf '%s\n' "$COV_OUT"
 
 PCT="$(printf '%s\n' "$COV_OUT" | sed -n 's/.* = \([0-9.]*\)%.*/\1/p' | tail -1)"

@@ -139,13 +139,8 @@ printf '# opencode-vpn\n' >> "$HOSTS_FILE"
 printf 'ACTIVE_LABEL=Node-1\nACTIVE_HOST=h.example\nACTIVE_PORT=443\nXRAY_PID=%s\n' "$$" > "$ACTIVE_FILE"
 printf '%s\n' "$$" > "$WATCH_PIDFILE"
 printf 'h\t443\t1.2.3.4\t9999999999\treason\n' > "$QUARANTINE_FILE"
-( pgrep() {
-    case "$*" in
-        *"-c"*"xray run"*) echo 1; return 0 ;;
-        *"xray run"*)      echo 4242; return 0 ;;
-    esac
-    return 1
-  }; do_status ) > "$WORK/st1.out" 2>&1
+( pgrep() { case "$*" in *"xray run"*) printf '1\n'; return 0 ;; esac; return 1; }
+  OCVPN_OS=Linux do_status ) > "$WORK/st1.out" 2>&1
 check_true "do_status версия" grep -q "ocvpn $OCVPN_VERSION" "$WORK/st1.out"
 check_true "do_status xray запущен" grep -q "xray: запущен (1 проц.)" "$WORK/st1.out"
 check_true "do_status ключ" grep -q "ключ: Node-1 (h.example:443)" "$WORK/st1.out"
@@ -156,7 +151,7 @@ check_true "do_status вотчдог запущен" grep -q "вотчдог: з
 # (2) всё выключено / пусто
 rm -f "$ACTIVE_FILE" "$WATCH_PIDFILE" "$QUARANTINE_FILE"
 grep -v 'opencode-vpn' "$HOSTS_FILE" > "$WORK/h.nomark" 2>/dev/null && mv "$WORK/h.nomark" "$HOSTS_FILE"
-( pgrep() { return 1; }; do_status ) > "$WORK/st2.out" 2>&1
+( pgrep() { return 1; }; OCVPN_OS=Linux do_status ) > "$WORK/st2.out" 2>&1
 check_true "do_status xray НЕ запущен" grep -q "xray: НЕ запущен" "$WORK/st2.out"
 check_true "do_status нет ключа" grep -q "ключ: нет активного" "$WORK/st2.out"
 check_true "do_status hosts нет" grep -q "$HOSTS_FILE: IPv4-записей нет" "$WORK/st2.out"

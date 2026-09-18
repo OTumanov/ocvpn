@@ -47,7 +47,10 @@ opencode и провайдеров.
 ## Как работает
 
 1. Скачивает подписку с ключами (plain-text и **base64**, V2Board/Marzban).
-2. Берёт `BATCH_SIZE` случайных поддерживаемых серверов, параллельно пингует (TCP-connect).
+2. Берёт `BATCH_SIZE` случайных поддерживаемых серверов, параллельно пингует
+   (TCP-connect). РФ-ноды (флаг 🇷🇺, латиница `RU`/`RUS`/`RUSSIA`/`RF`,
+   кириллица `РУ`/`РУС`/`РФ`/`Россия`, города) пропускаются — `OCVPN_SKIP_RU=0`
+   отключает.
 3. `MAX_TRIES` лучших по пингу — кандидаты; пробует реальное подключение через xray
    (`HTTP 204` на `google.com/generate_204`).
 4. Первый рабочий ключ → прозрачный прокси (`iptables nat OUTPUT` / macOS `pf rdr`).
@@ -146,6 +149,10 @@ ocvpn --subs https://…  # разовый источник ключей (URL п
 
 Скрипт автоматически установит xray (если нет) в `~/.local/opt/xray`, скачает
 ключи, найдёт рабочий сервер и поднимет прокси.
+
+Запуск без root (macOS/Linux) из интерактивного терминала сам перезапустится через
+`sudo` (один запрос пароля; `OCVPN_NO_ELEVATE=1` отключает). `--status`, `--hosts`,
+`--subs` работают без root.
 
 **После запуска** открой сессию opencode. Маршрутизация — на уровне ядра, env не нужны.
 
@@ -259,14 +266,20 @@ bash tests/coverage.sh   # покрытийные + гейт OCVPN_COV_MIN (по
 `tests/coverage.sh` прогоняет `ocvpn-coverage.sh` + кластеры `tests/cov-*.sh` под
 трассировкой и считает покрытие **исполняемых** строк `ocvpn.sh` (тела heredoc,
 структурные строки и многострочные литералы исключаются). Текущее покрытие —
-**96%** (`OCVPN_COV_LIST=1` печатает непокрытые строки). Порог: `OCVPN_COV_MIN=95`,
+**95%** (`OCVPN_COV_LIST=1` печатает непокрытые строки). Порог: `OCVPN_COV_MIN=95`,
 при недоборе — код выхода 3.
+
+> Для покрытия нужен **bash ≥ 4.1** (там есть `BASH_XTRACEFD`). На стоковом macOS
+> это `/bin/bash` 3.2 — поставь свежий (`brew install bash`) и запускай
+> `PATH="/opt/homebrew/bin:$PATH" bash tests/coverage.sh`. `coverage.sh` сам
+> сообщит об этом при старой версии.
 
 Кластеры: `cov-converters` (конвертеры протоколов), `cov-keys` (отбор/ротация),
 `cov-subs-routes` (подписки/маршруты/hosts), `cov-status` (CLI/статус/main),
 `cov-cli` (управление хостами), `cov-command` (`/ocvpn`, `--ensure-opencode`),
-`cov-edge` (граничные ветки), `cov-source` (top-level), `cov-regress` (регрессы
-исправленных багов), `cov-final`.
+`cov-edge` (граничные ветки), `cov-source` (top-level),
+`cov-hardening` (элевейт/убийство процессов/RU-фильтр/нормализация),
+`cov-regress` (регрессы исправленных багов), `cov-final`.
 
 > `tests/lib.sh` **жёстко изолирует** тесты: `iptables`/`pfctl`/`ss`/`ip`/`pkill`
 > заглушены, `HOME`/`/etc/hosts`/state — во временных файлах, а `_kill_matching`
@@ -311,6 +324,8 @@ TIMEOUT=5        # таймаут теста generate_204 (сек)
 | `OCVPN_RESET_IPS` | явный список IP для сброса соединений (для тестов/скриптов) |
 | `OCVPN_OPENCODE_CMD_DIR` | каталог установки команды `/ocvpn` |
 | `OCVPN_OPENCODE_BIN` / `OCVPN_OPENCODE_INSTALL_CMD` | override детекта/установки opencode |
+| `OCVPN_SKIP_RU` | пропускать РФ-ноды (флаг 🇷🇺, `RU`/`RUS`/`RUSSIA`/`RF`, кириллица `РУ`/`РУС`/`РФ`, города) при выборе; `0` — не пропускать (по умолчанию пропускает) |
+| `OCVPN_NO_ELEVATE` | `1` — не перезапускаться через `sudo` из терминала |
 | `OCVPN_COV_MIN` | порог покрытия в `tests/coverage.sh` (по умолчанию 95) |
 
 ## Подписка

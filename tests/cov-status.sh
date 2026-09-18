@@ -322,11 +322,11 @@ printf 'ACTIVE_LABEL=Node-7\nACTIVE_HOST=h7.example\nACTIVE_PORT=8443\nXRAY_PID=
 printf '%s\n' "$$" > "$WATCH_PIDFILE"
 printf 'h\t443\t1.2.3.4\t9999999999\treason\n' > "$QUARANTINE_FILE"
 out="$(
-    pgrep() { case "$*" in *"-cf"*xray*) echo 3; return 0 ;; *xray*) echo 4242; return 0 ;; *) return 1 ;; esac; }
+    pgrep() { case "$*" in *xray*) printf '1\n2\n3\n'; return 0 ;; *) return 1 ;; esac; }
     ss() { printf 'LISTEN 0 128 127.0.0.1:10808 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:10809 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:12345 0.0.0.0:*\n'; }
     iptables() { [[ "$*" == *"-S OUTPUT"* ]] && printf -- '-A OUTPUT -p tcp -j %s\n' "$IPTABLES_CHAIN"; return 0; }
     curl() { echo 5.6.7.8; }
-    do_status
+    OCVPN_OS=Linux do_status
 )"; rc=$?
 check_true "st1 version"   grep -q "ocvpn $OCVPN_VERSION" <<<"$out"
 check_true "st1 xray жив"  grep -q "xray: запущен (3 проц.)" <<<"$out"
@@ -346,7 +346,7 @@ out="$(
     pgrep() { return 1; }
     ss() { :; }
     iptables() { :; }
-    do_status
+    OCVPN_OS=Linux do_status
 )"; rc=$?
 check_true "st2 xray мёртв" grep -q "xray: НЕ запущен" <<<"$out"
 check_true "st2 нет ключа"  grep -q "ключ: нет активного" <<<"$out"

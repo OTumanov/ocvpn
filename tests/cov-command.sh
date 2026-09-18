@@ -24,6 +24,7 @@ check_true "в команде есть --hosts" grep -q -- '--hosts' "$CMD_DIR/o
 # SUDO_USER: целевой HOME берётся у пользователя (getent), а не $HOME
 mkdir -p "$WORK/sudohome"
 getent() { echo "sudoer:x:1000:1000::$WORK/sudohome:/bin/bash"; return 0; }
+dscl() { printf 'NFSHomeDirectory: %s\n' "$WORK/sudohome"; return 0; }
 out="$( SUDO_USER="sudoer" HOME="$WORK/root-home"; OCVPN_OPENCODE_CMD_DIR="" install_opencode_command 2>&1 )"
 check "SUDO_USER -> домашний каталог пользователя" "1" "$([[ -f "$WORK/sudohome/.config/opencode/commands/ocvpn.md" ]] && echo 1 || echo 0)"
 
@@ -35,7 +36,8 @@ check_true "help содержит --install-opencode-command" bash -c '
 # --- opencode_present / ensure_opencode ---
 mkdir -p "$WORK/emptybin"
 check "opencode_present нет" "1" "$( PATH="$WORK/emptybin"; HOME="$WORK/nohome"; OCVPN_OPENCODE_BIN=""; opencode_present >/dev/null 2>&1; echo $? )"
-check "opencode_present override" "/bin/true" "$(OCVPN_OPENCODE_BIN=/bin/true opencode_present)"
+check "opencode_present override" "/usr/bin/true" \
+    "$(OCVPN_OPENCODE_BIN=/usr/bin/true opencode_present)"
 check "opencode_present по конфигу" "(конфиг найден, бинарь не в PATH)" \
     "$( mkdir -p "$WORK/nohome/.config/opencode"; PATH="$WORK/emptybin"; HOME="$WORK/nohome"; OCVPN_OPENCODE_BIN=""; opencode_present )"
 

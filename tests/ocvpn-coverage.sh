@@ -465,7 +465,7 @@ check "SUBS_URL из /etc" "https://sys/sub" "$(HOME="$WORK/h2" OCVPN_SYS_SUBS_F
 curl() {
     local out=""
     while [[ $# -gt 0 ]]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
-    if [[ -n "$out" ]]; then : > "$out"; else echo '{"tag_name":"v9.9.9"}'; fi
+    if [[ -n "$out" ]]; then mkdir -p "$(dirname "$out")"; : > "$out"; else echo '{"tag_name":"v9.9.9"}'; fi
 }
 unzip() {
     local d=""
@@ -667,7 +667,10 @@ OCVPN_SUBS_FILE="$WORK/m_list.txt" download_subscription "$WORK/m_out.txt" >/dev
 check "multi-source count" "2" "$(grep -c . "$WORK/m_out.txt")"
 
 echo "=== [ZH] HOME default (systemd без HOME) ==="
-check "HOME default при пустом HOME" "/root" \
+# macOS-рут живёт в /var/root, Linux-рут — в /root.
+_expected_home="/root"
+[[ "$(uname -s)" == "Darwin" ]] && _expected_home="/var/root"
+check "HOME default при пустом HOME" "$_expected_home" \
     "$(env -u HOME env -u BASH_ENV -u OCVPN_TRACE_FILE bash -c 'source "$1"; printf "%s" "$HOME"' _ "$SCRIPT" 2>/dev/null)"
 check "HOME default не перебивает заданный" "$WORK/nohome" \
     "$(HOME="$WORK/nohome" env -u BASH_ENV -u OCVPN_TRACE_FILE bash -c 'source "$1"; printf "%s" "$HOME"' _ "$SCRIPT" 2>/dev/null)"

@@ -116,14 +116,15 @@ run_hosts_setup() {
     tmp="$TESTS_DIR/tmp-hosts-1"
     sed "/# opencode-vpn/d" "$HOSTS_FILE" > "$tmp"
     local ip d
-    declare -A seen
+    # resolve_ipv4 — та же логика, что и в скрипте (macOS dscacheutil/dig,
+    # Linux getent). Без bash-4 assoc-массивов: dedup через awk.
     for d in "${OPENCODE_DOMAINS[@]}"; do
         while IFS= read -r ip; do
-            [[ -z "$ip" || -n "${seen[$ip]+x}" ]] && continue
-            seen["$ip"]=1
+            [[ -z "$ip" ]] && continue
             printf '%-15s %s %s\n' "$ip" "$d" "# opencode-vpn" >> "$tmp"
-        done < <(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u)
+        done < <(resolve_ipv4 "$d" 2>/dev/null | sort -u)
     done
+    awk '!seen[$0]++' "$tmp" > "$tmp.2" 2>/dev/null && mv "$tmp.2" "$tmp"
     cp "$tmp" "$HOSTS_FILE"
     rm -f "$tmp"
 }
@@ -184,7 +185,7 @@ if [[ -s "$SUBS_TEST" ]]; then
     fi
 
     # парсим 5 случайных поддерживаемых реальных ключей через функцию
-    V5=$(grep -E '^vless://' "$SUBS_TEST" | while IFS= read -r k; do is_supported_key "$k" && echo "$k"; done | shuf -n 5 | while IFS= read -r k; do
+    V5=$(grep -E '^vless://' "$SUBS_TEST" | while IFS= read -r k; do is_supported_key "$k" && echo "$k"; done | shuffle | awk 'NR<=5' | while IFS= read -r k; do
         d="$TESTS_DIR/v5_$RANDOM"; mkdir -p "$d"
         vless_to_xray "$k" "$d" && python3 -m json.tool "$d/config.json" >/dev/null 2>&1 && echo S || echo F
     done | tr -d '\n')

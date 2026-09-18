@@ -4,15 +4,39 @@ set -euo pipefail
 # iptables обычно лежит в /usr/sbin или /sbin, которых может не быть в PATH
 # (в частности под sudo/systemd с урезанным PATH). Добавляем, не затирая остальное.
 export PATH="/usr/sbin:/sbin:$PATH"
-# systemd/launchd system-сервис не задаёт HOME — иначе set -u роняет скрипт.
-# У macOS-рута дом /var/root (/root там не существует, а ФС только для чтения).
-if [[ -z "${HOME:-}" ]]; then
+# Дом по умолчанию, когда HOME не задан (systemd/launchd): macOS-рут — /var/root
+# (/root там не существует, ФС только для чтения), Linux-рут — /root.
+_default_home() {
     if [[ "$(uname -s 2>/dev/null || echo Linux)" == "Darwin" ]]; then
-        export HOME=/var/root
+        printf '%s' /var/root
     else
-        export HOME=/root
+        printf '%s' /root
     fi
+}
+if [[ -z "${HOME:-}" ]]; then
+    export HOME="$(_default_home)"
 fi
+
+# Значение --user-home из аргументов (или пусто). Вынесено ради тестов.
+_parse_user_home() {
+    local a next=0
+    for a in "$@"; do
+        if (( next )); then printf '%s' "$a"; return 0; fi
+        [[ "$a" == "--user-home" ]] && next=1
+    done
+    return 1
+}
+
+# Дом ВЫЗВАВШЕГО пользователя. Под sudo HOME = root, но лог opencode, auth.json,
+# свои хосты, подписка и состояние — пользовательские. maybe_elevate передаёт
+# --user-home, чтобы root-держатель работал с ними, а не с /var/root.
+OCVPN_USER_HOME="${OCVPN_USER_HOME:-}"
+if [[ -z "$OCVPN_USER_HOME" ]]; then
+    OCVPN_USER_HOME="$(_parse_user_home "$@" || true)"
+fi
+# Экспортируем только если задан явно (--user-home): иначе подшеллы с другим
+# HOME должны использовать свой HOME, а не закешированный на старте.
+if [[ -n "$OCVPN_USER_HOME" ]]; then export OCVPN_USER_HOME; fi
 
 OCVPN_VERSION="1.5.5"
 # Linux (iptables REDIRECT) или macOS (pf rdr). Определяем один раз.
@@ -49,10 +73,10 @@ shuffle() {
 SUBS_FALLBACK_URL="https://xo.e0f.cx/sub/cE9h4oad4JvM0Pjk"
 SYS_SUBS_FILE="${OCVPN_SYS_SUBS_FILE:-/etc/ocvpn/subs-url}"
 SUBS_URL="${OCVPN_SUBS_URL:-}"
-if [[ -z "$SUBS_URL" && -s "$HOME/.ocvpn-subs-url" ]]; then
-    SUBS_URL="$(head -n1 "$HOME/.ocvpn-subs-url" 2>/dev/null | tr -d '[:space:]')"
+if [[ -z "$SUBS_URL" && -s "${OCVPN_USER_HOME:-$HOME}/.ocvpn-subs-url" && -r "${OCVPN_USER_HOME:-$HOME}/.ocvpn-subs-url" ]]; then
+    SUBS_URL="$(head -n1 "${OCVPN_USER_HOME:-$HOME}/.ocvpn-subs-url" 2>/dev/null | tr -d '[:space:]')"
 fi
-if [[ -z "$SUBS_URL" && -s "$SYS_SUBS_FILE" ]]; then
+if [[ -z "$SUBS_URL" && -s "$SYS_SUBS_FILE" && -r "$SYS_SUBS_FILE" ]]; then
     SUBS_URL="$(head -n1 "$SYS_SUBS_FILE" 2>/dev/null | tr -d '[:space:]')"
 fi
 # Флаг нужен, чтобы не пугать предупреждением, когда пользователь явно указал
@@ -86,7 +110,7 @@ OCVPN_LOG="${OCVPN_LOG:-/var/log/ocvpn.log}"
 # ВАЖНО: api.deepseek.com и ollama.com/api.ollama.com НЕ в списке — они ходят
 # напрямую (DIRECT), их через VPN не заворачиваем.
 # Пользовательские домены для обхода через VPN (добавляются `ocvpn --add-host`).
-USER_HOSTS_FILE="${OCVPN_USER_HOSTS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/ocvpn/hosts}"
+USER_HOSTS_FILE="${OCVPN_USER_HOSTS_FILE:-${XDG_CONFIG_HOME:-${OCVPN_USER_HOME:-$HOME}/.config}/ocvpn/hosts}"
 OPENCODE_DOMAINS=(
     # --- Инфраструктура OpenCode (v1.18.30) ---
     "opencode.ai"          # console auth/device, /console/api/*, Zen (/zen/v1), Go (/zen/go/v1)
@@ -144,7 +168,9 @@ cleanup() {
         kill "$XRAY_PID" 2>/dev/null || true
         wait "$XRAY_PID" 2>/dev/null || true
     fi
-    if [[ "${KEEP_ROUTES:-0}" != "1" ]]; then
+    # Снимаем маршруты только если реально их поставили (иначе при падении до
+    # setup_routes снесли бы чужой рабочий туннель).
+    if [[ "${KEEP_ROUTES:-0}" != "1" && "${ROUTES_APPLIED:-0}" == "1" ]]; then
         cleanup_routes
     fi
     rm -rf "${TMPDIR:-}" 2>/dev/null || true
@@ -155,22 +181,58 @@ trap cleanup EXIT
 # маршруты чужого запущенного ocvpn при своём завершении.
 no_cleanup() { trap - EXIT; }
 
-# Убить процессы по маске, кроме себя (pgrep не находит сам себя, но
-# на всякий случай исключаем $$).
+# PID текущего процесса и всей цепочки предков ($$, PPID, …). Их нельзя
+# убивать: под `exec sudo` родитель — `sudo /usr/local/bin/ocvpn`, он тоже
+# матчится маской `ocvpn$`, и без этого скрипт рубит сам себя.
+_self_and_ancestors() {
+    local p="$$" n=0
+    while [[ -n "$p" && "$p" != 0 && "$p" != 1 && $n -lt 64 ]]; do
+        printf '%s\n' "$p"
+        p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d '[:space:]')"
+        n=$((n + 1))
+    done
+}
+
+# Наш ли это процесс: мы сами, предок или потомок (форк-подшелл)? Такие
+# убивать нельзя — под `exec sudo` предок `sudo /usr/local/bin/ocvpn` матчится
+# маской `ocvpn$`, а форк-подшеллы наследуют argv и тоже попадают под pgrep.
+# KEEP_PIDS (self + предки) заполняет вызывающий до цикла.
+_is_own_proc() {
+    local pid="$1" p="$1" n=0
+    [[ "$pid" == "$$" ]] && return 0
+    [[ "${KEEP_PIDS:-}" == *$'\n'"$pid"$'\n'* ]] && return 0
+    while [[ -n "$p" && "$p" != 0 && "$p" != 1 && $n -lt 64 ]]; do
+        p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d '[:space:]')"
+        [[ "$p" == "$$" ]] && return 0
+        n=$((n + 1))
+    done
+    return 1
+}
+
 _kill_matching() {
     local pat="$1" pid
+    KEEP_PIDS=$'\n'"$(_self_and_ancestors)"$'\n'
     while IFS= read -r pid; do
-        [[ -z "$pid" || "$pid" == "$$" ]] && continue
+        [[ -z "$pid" ]] && continue
+        _is_own_proc "$pid" && continue
         kill "$pid" 2>/dev/null || true
     done < <(pgrep -f "$pat" 2>/dev/null || true)
 }
 
 _kill_matching9() {
     local pat="$1" pid
+    KEEP_PIDS=$'\n'"$(_self_and_ancestors)"$'\n'
     while IFS= read -r pid; do
-        [[ -z "$pid" || "$pid" == "$$" ]] && continue
+        [[ -z "$pid" ]] && continue
+        _is_own_proc "$pid" && continue
         kill -9 "$pid" 2>/dev/null || true
     done < <(pgrep -f "$pat" 2>/dev/null || true)
+}
+
+# Значение поля из active.env без source: state-файл не должен исполняться
+# (под root это потенциальный vector и просто хрупко при спецсимволах).
+_active_get() {
+    grep -E "^$1=" "$ACTIVE_FILE" 2>/dev/null | head -n1 | cut -d= -f2-
 }
 
 # Полная остановка: держатели, xray, вотчдоги + файлы состояния.
@@ -224,8 +286,8 @@ resolve_domains() {
             ips+=("$ip")
         done < <(resolve_ipv4 "$d")
     done
-    # dedup
-    printf '%s\n' "${ips[@]}" | sort -u
+    # dedup (bash 3.2: "${arr[@]}" на пустом массиве под set -u падает)
+    if [[ ${#ips[@]} -gt 0 ]]; then printf '%s\n' "${ips[@]}" | sort -u; fi
 }
 
 # === Flush REDIRECT rules, Linux (safe: только цепь OPENCODE_VPN) ===
@@ -234,7 +296,7 @@ cleanup_routes_linux() {
         iptables -t nat -F "$IPTABLES_CHAIN" 2>/dev/null || true
     fi
     # Удаляем ссылку из OUTPUT (если есть)
-    if iptables -t nat -S OUTPUT | grep -q -- "-j $IPTABLES_CHAIN"; then
+    if iptables -t nat -S OUTPUT | grep -F -- "-j $IPTABLES_CHAIN" >/dev/null; then
         iptables -t nat -D OUTPUT -p tcp -j "$IPTABLES_CHAIN" 2>/dev/null || true
     fi
     if iptables -t nat -L "$IPTABLES_CHAIN" >/dev/null 2>&1; then
@@ -331,7 +393,7 @@ setup_routes_linux() {
     if [[ $n -eq 0 ]]; then
         err "Не найден ни один IP эндпоинтов opencode. Отказываюсь от маршрутизации."
         cleanup_routes_linux
-        exit 1
+        return 1
     fi
 
     # 4) Подключаем цепь к OUTPUT (только новые исходящие TCP)
@@ -406,7 +468,7 @@ setup_routes_darwin() {
     if [[ "$n" -eq 0 ]]; then
         err "Не найден ни один IP эндпоинтов opencode. Отказываюсь от маршрутизации."
         hosts_cleanup
-        exit 1
+        return 1
     fi
 
     pf_anchor_content > "$PF_ANCHOR_FILE"
@@ -617,7 +679,7 @@ vless_to_xray() {
     local security="none" flow="" sni="" fp="" pbk="" sid="" alpn="" type="tcp" path="" host_param=""
     local serviceName="" mode=""
     IFS='&' read -ra PARAM_ARR <<< "$params"
-    for p in "${PARAM_ARR[@]}"; do
+    for p in ${PARAM_ARR[@]+"${PARAM_ARR[@]}"}; do
         local key="${p%%=*}"
         local val="${p#*=}"
         case "$key" in
@@ -828,7 +890,7 @@ trojan_to_xray() {
     local security="tls" sni="" fp="" alpn="" type="tcp" path="" host_param="" serviceName=""
     local p key val
     IFS='&' read -ra PARAM_ARR <<< "$params"
-    for p in "${PARAM_ARR[@]}"; do
+    for p in ${PARAM_ARR[@]+"${PARAM_ARR[@]}"}; do
         key="${p%%=*}"; val="${p#*=}"
         case "$key" in
             security) security="$val" ;;
@@ -1127,7 +1189,7 @@ candidate_pool() {
             continue
         fi
         printf '%s\n' "$u"
-    done < <(grep -E "$SUPPORTED_RE" "$subs_file")
+    done < <(grep -E "$SUPPORTED_RE" "$subs_file" | ru_filter)
 }
 
 # === Отбор N случайных НЕпробованных ключей по короткому TCP-пингу ===
@@ -1189,10 +1251,15 @@ _fetch_one_source() {
         printf '%s\n' "$src"
         return 0
     fi
-    # локальный файл: рекурсивно разбираем строки
+    # локальный файл: рекурсивно разбираем строки (обрезаем \r и пробелы —
+    # подписки из Windows/панелей бывают с CRLF и отступами)
     if [[ -f "$src" ]]; then
         local line
         while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line%$'\r'}"
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -z "$line" ]] && continue
             _fetch_one_source "$line"
         done < "$src"
         return 0
@@ -1216,6 +1283,9 @@ _fetch_one_source() {
             # возможно, это текстовый файл со списком ссылок на подписки
             local l
             while IFS= read -r l || [[ -n "$l" ]]; do
+                l="${l%$'\r'}"
+                l="${l#"${l%%[![:space:]]*}"}"
+                l="${l%"${l##*[![:space:]]}"}"
                 [[ -z "$l" || "$l" == \#* ]] && continue
                 [[ "$l" =~ ^https?:// ]] && _fetch_one_source "$l"
             done < "$raw"
@@ -1240,12 +1310,12 @@ download_subscription() {
         local sources=() line
         if [[ -n "${OCVPN_SUBS_URL:-}" ]]; then
             sources+=("$OCVPN_SUBS_URL")
-        elif [[ -s "$HOME/.ocvpn-subs-url" ]]; then
+        elif [[ -s "${OCVPN_USER_HOME:-$HOME}/.ocvpn-subs-url" && -r "${OCVPN_USER_HOME:-$HOME}/.ocvpn-subs-url" ]]; then
             while IFS= read -r line || [[ -n "$line" ]]; do
                 [[ -z "$line" || "$line" == \#* ]] && continue
                 sources+=("$line")
-            done < "$HOME/.ocvpn-subs-url"
-        elif [[ -s "$SYS_SUBS_FILE" ]]; then
+            done < "${OCVPN_USER_HOME:-$HOME}/.ocvpn-subs-url"
+        elif [[ -s "$SYS_SUBS_FILE" && -r "$SYS_SUBS_FILE" ]]; then
             while IFS= read -r line || [[ -n "$line" ]]; do
                 [[ -z "$line" || "$line" == \#* ]] && continue
                 sources+=("$line")
@@ -1264,7 +1334,8 @@ download_subscription() {
 
     # оставляем только поддерживаемые схемы и убираем дубли
     if [[ -s "$out" ]]; then
-        grep -E "$SUPPORTED_RE" "$out" | sort -u > "$out.uniq" || true
+        sed -e 's/\r$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$out" \
+            | grep -E "$SUPPORTED_RE" | sort -u > "$out.uniq" || true
         mv "$out.uniq" "$out"
     fi
     [[ -s "$out" ]] || { err "В источниках нет поддерживаемых ключей"; return 1; }
@@ -1294,6 +1365,53 @@ is_supported_key() {
     return 0
 }
 
+# РФ-ноды не подходят (гео/блокировки). Метку (fragment) percent-декодируем и
+# ловим: флаг 🇷🇺, латиницу (RU/RUS/RUSSIA/RF) и кириллицу (РУ/РУС/РФ/РОССИЯ),
+# плюс города — по границам слов, чтобы не цеплять Belarus/Peru/Brunei.
+# Отключается OCVPN_SKIP_RU=0.
+ru_filter() {
+    if [[ "${OCVPN_SKIP_RU:-1}" == 0 ]]; then
+        cat
+        return 0
+    fi
+    # Нет python — не теряем ключи, пропускаем без РФ-фильтра.
+    command -v python3 >/dev/null 2>&1 || { cat; return 0; }
+    local _rf_in
+    _rf_in="$(cat)"
+    printf '%s\n' "$_rf_in" | python3 -X utf8 -c "
+import sys, re, urllib.parse
+FLAG = '\U0001F1F7\U0001F1FA'
+# Короткие/неоднозначные токены — строго по границам слова (чтобы не задеть
+# Peru/Brunei/Prussia/Румынию/Беларусь).
+SHORT = re.compile(r'(?<![a-zа-яё])(russia|russian|rus|ru|rf|msk|spb|рус|ру|рф|мск|спб)(?![a-zа-яё])', re.I)
+# Отличимые основы — подстрокой (ловит падежи/окончания: Россия, Москва, Казань…).
+STEMS = (
+ 'rusfed','moscow','moskva','piter','petersburg','sankt','novosibir',
+ 'yekaterinburg','ekaterinburg','krasnodar','chelyabinsk','voronezh','volgograd',
+ 'krasnoyarsk','saratov','tyumen','izhevsk','barnaul','irkutsk','khabarovsk',
+ 'vladivostok','yaroslavl','orenburg','kemerovo','ryazan','astrakhan','lipetsk',
+ 'cheboksary','kaliningrad','stavropol','bryansk','ivanovo','belgorod','surgut',
+ 'arkhangelsk','murmansk','saransk','yakutsk','samara','rostov','kazan','tomsk',
+ 'smolensk','kaluga','vladimir','kirov','sochi','perm',
+ 'русск','росси','москв','новосиб','екатеринбург','краснодар','челябинск',
+ 'воронеж','волгоград','красноярск','саратов','тюмен','ижевск','барнаул',
+ 'иркутск','хабаровск','владивосток','ярослав','оренбург','кемеров','рязан',
+ 'астрахан','липецк','чебоксар','калининград','ставропол','брянск','иванов',
+ 'белгород','сургут','архангельск','мурманск','саранск','якутск','петербург',
+ 'питер','санкт','самар','ростов','казан','томск','вологд','смоленск','калуг',
+ 'владимир','киров','сочи','перм','омск','уфа','тула','твер','курск','пенз',
+)
+for line in sys.stdin:
+    line = line.rstrip('\n')
+    if not line:
+        continue
+    frag = urllib.parse.unquote(line.split('#', 1)[1]).lower() if '#' in line else ''
+    if FLAG in frag or SHORT.search(frag) or any(s in frag for s in STEMS):
+        continue
+    sys.stdout.write(line + '\n')
+" || printf '%s\n' "$_rf_in"
+}
+
 # === Автопереключение при лимитах opencode/zen/go ===
 # Триггерит ТОЛЬКО IP-лимиты opencode.ai/zen/go (free-tier лимитируется по IP —
 # смена выходного IP сбрасывает лимит). Аккаунтные лимиты (ollama, баланс,
@@ -1303,7 +1421,7 @@ is_supported_key() {
 # «Usage limit reached. It will reset in N minutes/hours/days». Если такой
 # хинт есть в строке лога — карантин выставляется по нему (+запас), иначе
 # QUARANTINE_HOURS по умолчанию.
-OCVPN_STATE_DIR="${OCVPN_STATE_DIR:-$HOME/.local/share/ocvpn}"
+OCVPN_STATE_DIR="${OCVPN_STATE_DIR:-${OCVPN_USER_HOME:-$HOME}/.local/share/ocvpn}"
 QUARANTINE_FILE="$OCVPN_STATE_DIR/quarantine.tsv"
 ROTATIONS_LOG="$OCVPN_STATE_DIR/rotations.tsv"
 ACTIVE_FILE="$OCVPN_STATE_DIR/active.env"
@@ -1314,7 +1432,7 @@ ROTATE_HOUR_FILE="$OCVPN_STATE_DIR/rotate_hour"
 QUARANTINE_HOURS="${OCVPN_QUARANTINE_HOURS:-6}"
 ROTATE_COOLDOWN="${OCVPN_ROTATE_COOLDOWN:-600}"
 ROTATE_MAX_PER_HOUR="${OCVPN_ROTATE_MAX_PER_HOUR:-6}"
-OPENCODE_LOG="${OCVPN_OPENCODE_LOG:-$HOME/.local/share/opencode/log/opencode.log}"
+OPENCODE_LOG="${OCVPN_OPENCODE_LOG:-${OCVPN_USER_HOME:-$HOME}/.local/share/opencode/log/opencode.log}"
 ACTIVE_HOST=""; ACTIVE_PORT=""; ACTIVE_LABEL=""; ACTIVE_EXIT_IP=""
 
 ROTATE_PATTERNS=(
@@ -1434,7 +1552,7 @@ GEO_BLOCK_PATTERNS=(
 )
 check_model_available() {
     local api_key=""
-    local auth_file="$HOME/.local/share/opencode/auth.json"
+    local auth_file="${OCVPN_USER_HOME:-$HOME}/.local/share/opencode/auth.json"
     if [[ -f "$auth_file" ]]; then
         api_key=$(python3 -c "
 import json, sys
@@ -1675,7 +1793,11 @@ reset_opencode_conns() {
 
 activate_current() {
     log "  Настраиваю маршрутизацию только для эндпоинтов opencode..."
-    setup_routes
+    if ! setup_routes; then
+        err "  не удалось применить маршрутизацию (см. выше)"
+        return 1
+    fi
+    ROUTES_APPLIED=1
     log ""
     log "Готово. Только трафик к эндпоинтам opencode идёт через VPN (рабочий ключ: $ACTIVE_LABEL, $ACTIVE_HOST:$ACTIVE_PORT, exit IP ${ACTIVE_EXIT_IP:-?})."
     log "Сайты на nginx и весь остальной хост — не тронуты."
@@ -1719,10 +1841,13 @@ rotate_now() {
     if pick_working_key "$old_ip"; then
         kill "$old_pid" 2>/dev/null || true
         wait "$old_pid" 2>/dev/null || true
-        activate_current
-        printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$old_ip" "$ACTIVE_EXIT_IP" "$ACTIVE_LABEL" >> "$ROTATIONS_LOG"
-        echo "$(date +%s)" > "$LAST_ROTATE_FILE"
-        log "РОТАЦИЯ: ${old_ip} → ${ACTIVE_EXIT_IP} (${ACTIVE_LABEL})"
+        if activate_current; then
+            printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$old_ip" "$ACTIVE_EXIT_IP" "$ACTIVE_LABEL" >> "$ROTATIONS_LOG"
+            echo "$(date +%s)" > "$LAST_ROTATE_FILE"
+            log "РОТАЦИЯ: ${old_ip} → ${ACTIVE_EXIT_IP} (${ACTIVE_LABEL})"
+        else
+            err "Ротация: маршруты не применены — проверь соединение"
+        fi
     else
         err "Ротация не удалась (нет ключей с другим IP) — старый ключ продолжает работать"
     fi
@@ -1747,21 +1872,20 @@ supervise() {
 # В терминал — пара строк, весь подбор — в $OCVPN_LOG.
 do_restart() {
     no_cleanup
-    local old_ip="" old_started=""
+    local old_ip="" old_started="" holder=""
     if [[ -f "$ACTIVE_FILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$ACTIVE_FILE" 2>/dev/null || true
-        old_ip="${ACTIVE_EXIT_IP:-}"; old_started="${STARTED:-}"
-        if [[ -n "${HOLDER_PID:-}" ]] && kill -0 "$HOLDER_PID" 2>/dev/null; then
-            log "Глушу держателя (pid $HOLDER_PID, exit IP ${old_ip:-?})…"
-            kill "$HOLDER_PID" 2>/dev/null || true
+        old_ip="$(_active_get ACTIVE_EXIT_IP)"; old_started="$(_active_get STARTED)"
+        holder="$(_active_get HOLDER_PID)"
+        if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
+            log "Глушу держателя (pid $holder, exit IP ${old_ip:-?})…"
+            kill "$holder" 2>/dev/null || true
             local i
             for i in $(seq 1 15); do
-                kill -0 "$HOLDER_PID" 2>/dev/null || break
+                kill -0 "$holder" 2>/dev/null || break
                 sleep 1
             done
-            if kill -0 "$HOLDER_PID" 2>/dev/null; then
-                kill -9 "$HOLDER_PID" 2>/dev/null || true
+            if kill -0 "$holder" 2>/dev/null; then
+                kill -9 "$holder" 2>/dev/null || true
                 sleep 1
             fi
             log "Держатель остановлен (маршруты сняты его trap'ом)."
@@ -1776,7 +1900,7 @@ do_restart() {
     done
     mkdir -p "$(dirname "$OCVPN_LOG")"
     log "Подбираю новый ключ в фоне (лог $OCVPN_LOG)…"
-    _spawn "$OCVPN_LOG" "$0"
+    _spawn "$OCVPN_LOG" "$0" --user-home "${OCVPN_USER_HOME:-$HOME}"
     local bgpid=$!
     # Ждём свежий active.env (подбор: подписка+пинг+тесты, обычно < 90 сек)
     local j
@@ -1790,7 +1914,7 @@ do_restart() {
             if [[ -n "$ns" && "$ns" != "$old_started" && -n "$nip" ]]; then
                 if [[ -n "$old_ip" && "$nip" == "$old_ip" ]]; then
                     log "Выпал тот же IP ($nip) — добираю другой…"
-                    bash "$0" --rotate "restart: тот же IP" >/dev/null 2>&1 || true
+                    bash "$0" --rotate "restart: тот же IP" --user-home "${OCVPN_USER_HOME:-$HOME}" >/dev/null 2>&1 || true
                     sleep 5
                     nip="$(grep -E '^ACTIVE_EXIT_IP=' "$ACTIVE_FILE" 2>/dev/null | cut -d= -f2)"
                 fi
@@ -1812,23 +1936,22 @@ do_rotate() {
     no_cleanup
     local reason="${1:-ручная ротация}"
     [[ -f "$ACTIVE_FILE" ]] || { err "Нет активного подключения ($ACTIVE_FILE). Запустите ocvpn сначала."; exit 1; }
-    # shellcheck disable=SC1090
-    source "$ACTIVE_FILE"
-    if ! kill -0 "${HOLDER_PID:-0}" 2>/dev/null; then
-        err "Держатель (pid ${HOLDER_PID:-?}) не запущен. Ротировать нечего."
+    local holder before
+    holder="$(_active_get HOLDER_PID)"
+    if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
+        err "Держатель (pid ${holder:-?}) не запущен. Ротировать нечего."
         exit 1
     fi
-    local before="${STARTED:-0}"
+    before="$(_active_get STARTED)"; before="${before:-0}"
     printf '%s' "$reason" > "$REASON_FILE"
-    kill -USR1 "$HOLDER_PID"
-    log "Сигнал ротации отправлен (pid $HOLDER_PID), жду новый IP…"
-    local i
+    kill -USR1 "$holder" 2>/dev/null || { err "Не удалось отправить сигнал держателю (pid $holder)"; exit 1; }
+    log "Сигнал ротации отправлен (pid $holder), жду новый IP…"
+    local i ns nip
     for i in $(seq 1 60); do
         sleep 2
-        # shellcheck disable=SC1090
-        source "$ACTIVE_FILE"
-        if [[ "${STARTED:-0}" != "$before" && -n "${ACTIVE_EXIT_IP:-}" ]]; then
-            log "РОТАЦИЯ выполнена: exit IP ${ACTIVE_EXIT_IP} (${ACTIVE_LABEL:-?})"
+        ns="$(_active_get STARTED)"; nip="$(_active_get ACTIVE_EXIT_IP)"
+        if [[ "${ns:-0}" != "$before" && -n "$nip" ]]; then
+            log "РОТАЦИЯ выполнена: exit IP $nip ($(_active_get ACTIVE_LABEL))"
             return 0
         fi
     done
@@ -2117,7 +2240,7 @@ do_status() {
     fi
     local p
     for p in "$SOCKS_PORT" "$HTTP_PORT" "$REDIRECT_PORT"; do
-        if (command -v ss &>/dev/null && ss -tln 2>/dev/null | grep -q ":$p ") \
+        if (command -v ss &>/dev/null && ss -tln 2>/dev/null | grep -F ":$p " >/dev/null) \
             || (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null; then
             { exec 3>&-; } 2>/dev/null || true
             echo "порт $p: слушается"
@@ -2127,7 +2250,7 @@ do_status() {
         fi
     done
     if is_macos; then
-        if pfctl -s rules 2>/dev/null | grep -q ocvpn_targets \
+        if pfctl -s rules 2>/dev/null | grep -F ocvpn_targets >/dev/null \
             || { [[ -f "$PF_ANCHOR_FILE" ]] && grep -q ocvpn_targets "$PF_ANCHOR_FILE"; }; then
             echo "маршруты (pf $PF_ANCHOR): есть"
         else
@@ -2135,7 +2258,7 @@ do_status() {
             rc=1
         fi
     else
-        if iptables -t nat -S OUTPUT 2>/dev/null | grep -q -- "-j $IPTABLES_CHAIN"; then
+        if iptables -t nat -S OUTPUT 2>/dev/null | grep -F -- "-j $IPTABLES_CHAIN" >/dev/null; then
             echo "маршруты (iptables $IPTABLES_CHAIN): есть"
         else
             echo "маршруты (iptables $IPTABLES_CHAIN): нет"
@@ -2150,9 +2273,11 @@ do_status() {
     fi
     # Активный ключ / exit IP / карантин / вотчдог (всё read-only)
     if [[ -f "$ACTIVE_FILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$ACTIVE_FILE" 2>/dev/null || true
-        echo "ключ: ${ACTIVE_LABEL:-?} (${ACTIVE_HOST:-?}:${ACTIVE_PORT:-?})"
+        local kl kh kp
+        kl="$(_active_get ACTIVE_LABEL)"; kl="${kl:-?}"
+        kh="$(_active_get ACTIVE_HOST)"; kh="${kh:-?}"
+        kp="$(_active_get ACTIVE_PORT)"; kp="${kp:-?}"
+        echo "ключ: $kl ($kh:$kp)"
     else
         echo "ключ: нет активного (active.env)"
     fi
@@ -2185,10 +2310,107 @@ exit_ip_fast() {
     return 0
 }
 
+# === Автоподъём прав ===
+# Командам, которые правят маршруты (pf/iptables), нужен root. Если запускают
+# из интерактивного терминала не от root — прозрачно перезапускаемся через sudo
+# (один запрос пароля). Не-TTY (тесты/CI/агент) и OCVPN_NO_ELEVATE не трогаем.
+_has_watch() { local a; for a in "$@"; do [[ "$a" == "--watch" ]] && return 0; done; return 1; }
+_args_without_watch() { local a; for a in "$@"; do [[ "$a" == "--watch" ]] || printf '%s\n' "$a"; done; return 0; }
+
+# Запуск в фоне. --watch => поднять и держателя, и отдельный вотчдог (раньше в
+# фон уходил только вотчдог без VPN). Вынесено ради тестов.
+daemon_start() {
+    no_cleanup
+    mkdir -p "$(dirname "$OCVPN_LOG")"
+    local -a pass=() a
+    while IFS= read -r a; do [[ -n "$a" ]] && pass+=("$a"); done \
+        < <(_args_without_watch "$@")
+    # shellcheck disable=SC2094
+    _spawn "$OCVPN_LOG" "$0" ${pass[@]+"${pass[@]}"}
+    log "ocvpn $OCVPN_VERSION запущен в фоне (лог $OCVPN_LOG)"
+    if _has_watch "$@"; then
+        _spawn "$OCVPN_LOG" "$0" --watch --user-home "${OCVPN_USER_HOME:-$HOME}"
+        log "вотчдог запущен (pid $!)"
+    fi
+    return 0
+}
+
+_needs_root() {
+    case "${1:-}" in
+        ""|--rotate|--new-ip|--restart|--watch|--daemon|-d|--cleanup|--add-host|--rm-host|--remove-host) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Доп. аргументы для `sudo` (по строке): дом пользователя + источник подписки,
+# если их нет среди аргументов. Вынесено отдельно ради тестов.
+_elevate_args() {
+    local -a extra=() a
+    local have_subs=0 have_home=0
+    for a in "$@"; do
+        [[ "$a" == "--subs" ]] && have_subs=1
+        [[ "$a" == "--user-home" ]] && have_home=1
+    done
+    [[ $have_home -eq 0 ]] && extra+=(--user-home "${OCVPN_USER_HOME:-$HOME}")
+    if [[ $have_subs -eq 0 && -n "${OCVPN_SUBS_FILE:-}" ]]; then
+        extra+=(--subs "$OCVPN_SUBS_FILE")
+    elif [[ $have_subs -eq 0 && -n "${SUBS_URL:-}" \
+            && "$SUBS_URL" != "$SUBS_FALLBACK_URL" ]]; then
+        extra+=(--subs "$SUBS_URL")
+    fi
+    [[ ${#extra[@]} -gt 0 ]] && printf '%s\n' "${extra[@]}"
+    return 0
+}
+
+# Нужен ли подъём прав? Вынесено ради тестов (OCVPN_ASSUME_TTY эмулирует TTY).
+_elevate_active() {
+    [[ "$(id -u 2>/dev/null || echo 1)" == "0" ]] && return 1
+    [[ -n "${OCVPN_NO_ELEVATE:-}" ]] && return 1
+    if [[ -z "${OCVPN_ASSUME_TTY:-}" ]]; then
+        [[ -t 0 && -t 1 ]] || return 1
+    fi
+    command -v sudo >/dev/null 2>&1 || return 1
+    return 0
+}
+
+_self_path() {
+    local self="$0"
+    [[ -f "$self" ]] || self="$(command -v ocvpn 2>/dev/null || printf '%s' "$0")"
+    printf '%s' "$self"
+}
+
+# Перезапуск себя под sudo. OCVPN_ELEVATE_DRYRUN=1 — только печать (тесты).
+_elevate_exec() {
+    local self="$1"; shift
+    printf '%s\n' "[i] Для маршрутизации нужен root — перезапускаю через sudo…" >&2
+    if [[ -n "${OCVPN_ELEVATE_DRYRUN:-}" ]]; then
+        printf 'SUDO %s' "$self"; printf ' %s' "$@"; printf '\n'
+        return 0
+    fi
+    exec sudo "$self" "$@"
+}
+
+maybe_elevate() {
+    _elevate_active || return 0
+    local self; self="$(_self_path)"
+    local -a extra=() a
+    while IFS= read -r a; do [[ -n "$a" ]] && extra+=("$a"); done \
+        < <(_elevate_args "$@")
+    # bash 3.2 (macOS) ругается на "${arr[@]}" при пустом массиве под set -u.
+    if [[ ${#extra[@]} -gt 0 ]]; then
+        _elevate_exec "$self" "${extra[@]}" "$@"
+    else
+        _elevate_exec "$self" "$@"
+    fi
+}
+
 main() {
     # --subs <url|файл> в любом месте командной строки: разовый источник ключей
     # для этого запуска/рестарта (фоновым потомкам достаётся через export).
     parse_subs_flag "$@"
+    if _needs_root "$@"; then
+        maybe_elevate "$@"
+    fi
     if [[ -n "${OCVPN_SUBS_URL:-}" ]]; then
         SUBS_URL="$OCVPN_SUBS_URL"
     fi
@@ -2245,13 +2467,8 @@ main() {
             ;;
         --daemon|-d)
             # Фон: отрыв от терминала (setsid, если есть, иначе голый & — см. _spawn).
-            # Использование: ocvpn --daemon [те же аргументы, что и у обычного запуска]
-            no_cleanup  # родитель никого не владеет — маршруты ставит потомок
             shift
-            mkdir -p "$(dirname "$OCVPN_LOG")"
-            # shellcheck disable=SC2094
-            _spawn "$OCVPN_LOG" "$0" "$@"
-            log "ocvpn $OCVPN_VERSION запущен в фоне (pid $!, лог $OCVPN_LOG)"
+            daemon_start "$@"
             exit 0
             ;;
         --cleanup)
@@ -2275,7 +2492,8 @@ main() {
         done
     fi
 
-    if [[ "$SUBS_FROM_FALLBACK" == 1 ]]; then
+    if [[ "$SUBS_FROM_FALLBACK" == 1 && "${OCVPN_SUBS_FROM_FLAG:-0}" != 1 \
+          && -z "${OCVPN_SUBS_FILE:-}" ]]; then
         warn "Подписка не задана — используется публичный fallback-источник (чужой). Своя: ~/.ocvpn-subs-url или системная /etc/ocvpn/subs-url"
     fi
     if [[ "${OCVPN_SUBS_FROM_FLAG:-}" == 1 ]]; then
@@ -2284,19 +2502,22 @@ main() {
 
     OCVPN_OWNER=1  # этот процесс владеет xray+маршрутами — EXIT-trap активен
     mkdir -p "$TMPDIR_BASE"
-    # Singleton: гасим прошлые держатели/xray/вотчдоги, чтобы не плодить дубли.
-    stop_all
     TMPDIR=$(mktemp -d "$TMPDIR_BASE/XXXXXX")
 
     find_xray
 
+    # Сначала валидируем подписку, и только потом гасим прошлый туннель: иначе
+    # при пустой/битой подписке пользователь остаётся без VPN вообще.
     fetch_subscription || exit 1
+
+    # Singleton: гасим прошлые держатели/xray/вотчдоги, чтобы не плодить дубли.
+    stop_all
 
     if ! pick_working_key ""; then
         err "Все кандидаты не сработали. Запусти ещё раз — будут другие случайные."
         exit 1
     fi
-    activate_current
+    activate_current || exit 1
     # Держим xray: USR1-ротация уже armed (trap rotate_now), дальше supervise.
     # На выходе cleanup снимет маршруты, т.к. xray уже будет мёртв
     # и REDIRECT-правила стали бы чёрной дырой.
