@@ -72,9 +72,9 @@ check "bin исполняемый" "1" "$([[ -x "$BIN" ]] && echo 1 || echo 0)"
 # ===========================================================================
 echo "=== [5] do_update: уже последняя ==="
 FAKE_SCRIPT='#!/usr/bin/env bash
-OCVPN_VERSION="1.5.5"'
-REL_JSON='{"tag_name":"v1.5.5"}'
-TAGS_JSON='[{"name":"v1.5.5"}]'
+OCVPN_VERSION="'"$OCVPN_VERSION"'"'
+REL_JSON="{\"tag_name\":\"v$OCVPN_VERSION\"}"
+TAGS_JSON="[{\"name\":\"v$OCVPN_VERSION\"}]"
 rm -f "$BIN"
 out="$( OCVPN_BIN="$BIN" OCVPN_APP_SCRIPT="$APP" OCVPN_REPO="test/repo" \
     OCVPN_UPDATE_TTL=0 do_update 2>&1 )"

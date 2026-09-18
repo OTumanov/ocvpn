@@ -38,7 +38,7 @@ fi
 # HOME должны использовать свой HOME, а не закешированный на старте.
 if [[ -n "$OCVPN_USER_HOME" ]]; then export OCVPN_USER_HOME; fi
 
-OCVPN_VERSION="1.5.5"
+OCVPN_VERSION="1.5.6"
 # Linux (iptables REDIRECT) или macOS (pf rdr). Определяем один раз.
 OCVPN_OS="$(uname -s 2>/dev/null || echo Linux)"
 is_macos() { [[ "$OCVPN_OS" == "Darwin" ]]; }

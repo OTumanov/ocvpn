@@ -2,7 +2,7 @@
 # Дымовой тест харнесса: проверяем, что lib.sh корректно изолирует окружение.
 . "$(dirname "$0")/lib.sh"
 
-check "версия читается" "1.5.5" "$OCVPN_VERSION"
+check_true "версия читается" bash -c '[[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]' _ "$OCVPN_VERSION"
 check "HOSTS_FILE изолирован" "$WORK/hosts" "$HOSTS_FILE"
 check "USER_HOSTS_FILE изолирован" "$WORK/user-hosts" "$USER_HOSTS_FILE"
 check "hosts_list содержит openrouter" "1" "$(hosts_list | grep -c '^openrouter.ai$')"
