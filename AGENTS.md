@@ -64,8 +64,8 @@ ocvpn --hosts                       # список доменов, идущих 
 
 ## 4. Команда `/ocvpn` в opencode
 После установки в opencode доступна команда `/ocvpn` (меню): статус, смена IP,
-подписка, свои хосты (`--add-host`/`--rm-host`/`--hosts`), старт/стоп, очистка.
-Она лежит в `~/.config/opencode/commands/ocvpn.md`.
+подписка, свои хосты (`--add-host`/`--rm-host`/`--hosts`), старт/стоп, очистка,
+обновление (`--update`). Она лежит в `~/.config/opencode/commands/ocvpn.md`.
 
 ## 5. Частые команды
 ```sh
@@ -76,7 +76,10 @@ ocvpn --add-host DOMAIN    # завести свой домен через VPN (
 ocvpn --rm-host DOMAIN     # убрать домен
 ocvpn --hosts              # список доменов
 ocvpn --cleanup            # снять маршруты и записи /etc/hosts
+ocvpn --update             # поставить последнюю версию из GitHub
 ```
+При обычном запуске `ocvpn` сам проверяет новую версию и предлагает обновиться
+(отключить: `OCVPN_NO_UPDATE_CHECK=1`).
 
 ## 6. Важно
 - Не вызывай интерактивный `sudo` — только `sudo -n` после проверки прав.

@@ -2170,14 +2170,157 @@ description: Управление ocvpn — статус VPN, подписка, 
 3. Свой хост через VPN — спроси домен(ы) и выполни `ocvpn --add-host <домен>`; убрать — `ocvpn --rm-host <домен>`; показать список — `ocvpn --hosts`.
 4. Старт/стоп сервиса — Linux: `systemctl start|stop ocvpn`; macOS: `launchctl kickstart -k system/ai.opencode.ocvpn` / `launchctl bootout system/ai.opencode.ocvpn`.
 5. Очистка — `ocvpn --cleanup`.
+6. Обновление — `ocvpn --update` (последняя версия из GitHub).
 
 Правила:
 - Никогда не запускай интерактивный `sudo` (зависнет). Сначала `id -u`; если не root — `sudo -n true`.
   Есть права → команды напрямую или через `sudo -n`. Нет → только `ocvpn --status`/`--subs`/`--hosts` и инструкция «перезапустите opencode».
-- Подкоманды: `/ocvpn ip|new-ip`, `/ocvpn subs <URL>`, `/ocvpn add-host <домен>`, `/ocvpn rm-host <домен>`, `/ocvpn hosts`, `/ocvpn start|stop`, `/ocvpn cleanup`, `/ocvpn status`.
+- Подкоманды: `/ocvpn ip|new-ip`, `/ocvpn subs <URL>`, `/ocvpn add-host <домен>`, `/ocvpn rm-host <домен>`, `/ocvpn hosts`, `/ocvpn start|stop`, `/ocvpn cleanup`, `/ocvpn status`, `/ocvpn update`.
 - Ничего сверх перечисленного не делай.
 OCVPN_CMD_MD
     log "Команда /ocvpn установлена: $cfg/ocvpn.md"
+    return 0
+}
+
+# === Обновление из GitHub ===
+# $1 > $2 для версий x.y.z (bash 3.2-совместимо, без sort -V).
+_ver_gt() {
+    local a="$1" b="$2" IFS='.'
+    local -a A=($a) B=($b)
+    local i x y
+    for i in 0 1 2 3 4; do
+        x="${A[$i]:-0}"; y="${B[$i]:-0}"
+        [[ "$x" =~ ^[0-9]+$ ]] || x=0
+        [[ "$y" =~ ^[0-9]+$ ]] || y=0
+        (( 10#$x > 10#$y )) && return 0
+        (( 10#$x < 10#$y )) && return 1
+    done
+    return 1
+}
+
+# Последняя доступная версия в репозитории и ref для неё.
+# Печатает "version<TAB>ref" (ref — тег вида vX.Y.Z либо main).
+gh_resolve() {
+    local repo="$1" rel tag main_tmp="" main_ver="" best="" ref="" v
+    rel="$(curl -fsSL --connect-timeout 8 --max-time 15 "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get("tag_name","") or "")' 2>/dev/null || true)"
+    tag="$(curl -fsSL --connect-timeout 8 --max-time 15 "https://api.github.com/repos/$repo/tags" 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[0]["name"] if d else "")' 2>/dev/null || true)"
+    # main может быть впереди тегов (maintainer коммитит без релиза)
+    main_tmp="$(mktemp /tmp/ocvpn-main.XXXXXX)"
+    if curl -fsSL --connect-timeout 8 --max-time 30 \
+        "https://raw.githubusercontent.com/$repo/main/ocvpn.sh" -o "$main_tmp" 2>/dev/null; then
+        main_ver="$(grep -m1 -o 'OCVPN_VERSION="[0-9.]*"' "$main_tmp" 2>/dev/null | cut -d'"' -f2)"
+    fi
+    rm -f "$main_tmp"
+    for v in "${rel#v}" "${tag#v}" "${main_ver:-}"; do
+        [[ -z "$v" ]] && continue
+        if [[ -z "$best" ]] || _ver_gt "$v" "$best"; then best="$v"; fi
+    done
+    [[ -n "$best" ]] || return 1
+    if [[ -n "$main_ver" && "$best" == "$main_ver" ]]; then
+        ref="main"
+    elif [[ -n "$tag" && "${tag#v}" == "$best" ]]; then
+        ref="$tag"
+    elif [[ -n "$rel" && "${rel#v}" == "$best" ]]; then
+        ref="$rel"
+    else
+        ref="v$best"
+    fi
+    printf '%s\t%s\n' "$best" "$ref"
+}
+
+gh_latest_version() { gh_resolve "$1" 2>/dev/null | cut -f1; }
+
+# С кешем (по умолчанию 1 ч), чтобы не дёргать GH при каждом старте.
+gh_latest_version_cached() {
+    local repo="$1" cache ttl now last ver
+    cache="${OCVPN_STATE_DIR:-${OCVPN_USER_HOME:-$HOME}/.local/share/ocvpn}/update_check"
+    ttl="${OCVPN_UPDATE_TTL:-3600}"
+    now="$(date +%s 2>/dev/null || echo 0)"
+    if [[ "$ttl" != "0" && -f "$cache" ]]; then
+        last="$(cut -f1 "$cache" 2>/dev/null)"
+        ver="$(cut -f2 "$cache" 2>/dev/null)"
+        if [[ -n "$last" && -n "$ver" ]] && (( now - last < ttl )); then
+            printf '%s' "$ver"; return 0
+        fi
+    fi
+    ver="$(gh_latest_version "$repo" || true)"
+    if [[ -n "$ver" ]]; then
+        mkdir -p "$(dirname "$cache")" 2>/dev/null || true
+        printf '%s\t%s\n' "$now" "$ver" > "$cache" 2>/dev/null || true
+    fi
+    printf '%s' "$ver"
+}
+
+# Скачать и установить последнюю версию ocvpn.sh из GitHub.
+do_update() {
+    local repo="${OCVPN_REPO:-OTumanov/ocvpn}"
+    local bin="${OCVPN_BIN:-/usr/local/bin/ocvpn}"
+    local app="${OCVPN_APP_SCRIPT:-/Applications/OCVPN.app/Contents/Resources/ocvpn.sh}"
+    local curver="$OCVPN_VERSION" resolved ver ref tmp="" newver=""
+    log "Проверяю обновления: $repo…"
+    resolved="$(gh_resolve "$repo")" || true
+    if [[ -z "$resolved" ]]; then
+        err "Не удалось определить последнюю версию в $repo (нет сети?)"
+        return 1
+    fi
+    ver="${resolved%%$'\t'*}"
+    ref="${resolved#*$'\t'}"
+    if [[ "$ver" == "$curver" ]]; then
+        log "Уже последняя версия: $curver."
+        return 0
+    fi
+    tmp="$(mktemp /tmp/ocvpn-upd.XXXXXX)"
+    if ! curl -fsSL --connect-timeout 10 --max-time 60 \
+        "https://raw.githubusercontent.com/$repo/$ref/ocvpn.sh" -o "$tmp" 2>/dev/null; then
+        err "Не удалось скачать $repo@$ref"
+        rm -f "$tmp"; return 1
+    fi
+    # базовая валидация: это bash-скрипт ocvpn
+    if ! grep -q 'OCVPN_VERSION=' "$tmp" 2>/dev/null || ! bash -n "$tmp" 2>/dev/null; then
+        err "Скачанный файл не похож на ocvpn.sh — прерываю."
+        rm -f "$tmp"; return 1
+    fi
+    newver="$(grep -m1 -o 'OCVPN_VERSION="[0-9.]*"' "$tmp" | cut -d'"' -f2)"
+    newver="${newver:-$ver}"
+    log "Обновляю $curver → $newver ($ref)…"
+    if ! install -m 0755 "$tmp" "$bin" 2>/dev/null; then
+        err "Не удалось установить $bin (нужен root?)"
+        rm -f "$tmp"; return 1
+    fi
+    if [[ -f "$app" ]]; then
+        install -m 0644 "$tmp" "$app" 2>/dev/null && log "Обновлён бандл GUI: $app"
+    fi
+    rm -f "$tmp"
+    log "Установлено: $( "$bin" --version 2>/dev/null || echo "ocvpn $newver" )"
+    warn "Перезапусти VPN: ocvpn --restart"
+    return 0
+}
+
+# При старте: если в GH есть новее — сообщить и (в TTY) предложить обновиться.
+check_update_offer() {
+    [[ -n "${OCVPN_NO_UPDATE_CHECK:-}" ]] && return 0
+    local latest tty_ok=0 ans=""
+    latest="$(gh_latest_version_cached "${OCVPN_REPO:-OTumanov/ocvpn}")"
+    [[ -n "$latest" ]] || return 0
+    _ver_gt "$latest" "$OCVPN_VERSION" || return 0
+    warn "Доступна новая версия ocvpn: $latest (у тебя $OCVPN_VERSION)."
+    if [[ -n "${OCVPN_ASSUME_TTY:-}" ]] || { [[ -t 0 ]] && [[ -t 1 ]]; }; then
+        tty_ok=1
+    fi
+    if [[ $tty_ok -eq 1 ]]; then
+        printf '%s' "Обновить сейчас? [y/N] "
+        read -r ans || true
+        if [[ "$ans" == [yYдД]* || "$ans" == yes || "$ans" == YES || "$ans" == да || "$ans" == ДА ]]; then
+            if do_update; then
+                log "Запускаю обновлённую версию…"
+                exec "${OCVPN_BIN:-/usr/local/bin/ocvpn}" "$@"
+            fi
+        else
+            log "Обновление отложено. Отключить проверку: OCVPN_NO_UPDATE_CHECK=1"
+        fi
+    else
+        log "Обновиться: ocvpn --update"
+    fi
     return 0
 }
 
@@ -2221,6 +2364,7 @@ http/https (прокси), socks/socks5. hysteria2 не поддерживает
   ocvpn --hosts           показать итоговый список доменов (встроенные + свои)
   ocvpn --cleanup        снять маршрутизацию, убрать IPv4-записи из /etc/hosts
   ocvpn --status         показать состояние (xray, порты, маршруты, exit IP, карантин)
+  ocvpn --update         скачать и установить последнюю версию из GitHub (Linux/macOS)
   ocvpn --version        версия
   ocvpn --help           эта справка
 
@@ -2337,7 +2481,7 @@ daemon_start() {
 
 _needs_root() {
     case "${1:-}" in
-        ""|--rotate|--new-ip|--restart|--watch|--daemon|-d|--cleanup|--add-host|--rm-host|--remove-host) return 0 ;;
+        ""|--rotate|--new-ip|--restart|--watch|--daemon|-d|--cleanup|--add-host|--rm-host|--remove-host|--update|--self-update) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -2479,7 +2623,15 @@ main() {
             log "OCVPN остановлен: xray/вотчдог убиты, маршруты сняты."
             exit 0
             ;;
+        --update|--self-update)
+            no_cleanup
+            do_update
+            exit $?
+            ;;
     esac
+
+    # Проверка новой версии при запуске (с кешем; в TTY предложит обновиться).
+    check_update_offer "$@"
 
     # Check dependencies (набор зависит от ОС)
     if is_macos; then

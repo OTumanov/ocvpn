@@ -185,6 +185,7 @@ ocvpn --ensure-opencode auto       # найти opencode; если нет — п
 | `ocvpn --new-ip` / `--rotate [why]` | Сменить exit IP сейчас (новый применяется сразу) |
 | `ocvpn --restart` | Перезапустить в фоне: новый ключ (+ обычно новый IP) |
 | `ocvpn --status` | Состояние: xray, порты, маршруты, ключ, exit IP, карантин, вотчдог |
+| `ocvpn --update` | Скачать и установить последнюю версию из GitHub (Linux/macOS) |
 | `ocvpn --cleanup` | Снять маршруты и убрать IPv4-записи из `/etc/hosts` |
 | `ocvpn --add-host ДОМЕН` | Добавить свой домен в обход через VPN (сразу, если активен) |
 | `ocvpn --rm-host ДОМЕН` | Убрать домен из пользовательского списка |
@@ -195,6 +196,25 @@ ocvpn --ensure-opencode auto       # найти opencode; если нет — п
 `--subs URL|ФАЙЛ` можно передать в любом месте командной строки — разовый источник
 ключей (URL подписки или готовый txt с `vless://`), например
 `ocvpn --subs https://provider/sub --restart`.
+
+## Обновление
+
+```bash
+ocvpn --update          # скачать и установить последнюю версию из GitHub
+```
+
+`--update` смотрит **release**, **теги** и **main** репозитория
+(`OCVPN_REPO`, по умолчанию `OTumanov/ocvpn`), берёт максимальную версию,
+скачивает `ocvpn.sh` соответствующего ref, проверяет его (`bash -n` + маркер
+`OCVPN_VERSION`) и ставит в `/usr/local/bin/ocvpn`; на macOS заодно обновляет
+скрипт внутри бандла GUI (`/Applications/OCVPN.app`), чтобы self-install не
+откатил. Нужен root — из терминала права поднимаются автоматически.
+
+**При обычном запуске** `ocvpn` сам проверяет новую версию (результат кешируется
+на час) и, если она есть, в интерактивном терминале предлагает обновиться
+(`Обновить сейчас? [y/N]`), после чего перезапускается уже новой версией. Без
+TTY просто пишет подсказку `ocvpn --update`. Отключить:
+`OCVPN_NO_UPDATE_CHECK=1`; период кеша — `OCVPN_UPDATE_TTL` (сек, `0` — каждый раз).
 
 ## Вотчдог лимитов и ротация
 
@@ -279,6 +299,7 @@ bash tests/coverage.sh   # покрытийные + гейт OCVPN_COV_MIN (по
 `cov-cli` (управление хостами), `cov-command` (`/ocvpn`, `--ensure-opencode`),
 `cov-edge` (граничные ветки), `cov-source` (top-level),
 `cov-hardening` (элевейт/убийство процессов/RU-фильтр/нормализация),
+`cov-update` (`--update` и проверка обновлений),
 `cov-regress` (регрессы исправленных багов), `cov-final`.
 
 > `tests/lib.sh` **жёстко изолирует** тесты: `iptables`/`pfctl`/`ss`/`ip`/`pkill`
@@ -326,6 +347,10 @@ TIMEOUT=5        # таймаут теста generate_204 (сек)
 | `OCVPN_OPENCODE_BIN` / `OCVPN_OPENCODE_INSTALL_CMD` | override детекта/установки opencode |
 | `OCVPN_SKIP_RU` | пропускать РФ-ноды (флаг 🇷🇺, `RU`/`RUS`/`RUSSIA`/`RF`, кириллица `РУ`/`РУС`/`РФ`, города) при выборе; `0` — не пропускать (по умолчанию пропускает) |
 | `OCVPN_NO_ELEVATE` | `1` — не перезапускаться через `sudo` из терминала |
+| `OCVPN_REPO` | GitHub-репозиторий для `--update` (по умолчанию `OTumanov/ocvpn`) |
+| `OCVPN_NO_UPDATE_CHECK` | `1` — не проверять новую версию при запуске |
+| `OCVPN_UPDATE_TTL` | период кеша проверки обновлений, сек (по умолчанию 3600; `0` — каждый раз) |
+| `OCVPN_BIN` / `OCVPN_APP_SCRIPT` | override путей установки для `--update` (по умолчанию `/usr/local/bin/ocvpn` и бандл GUI) |
 | `OCVPN_COV_MIN` | порог покрытия в `tests/coverage.sh` (по умолчанию 95) |
 
 ## Подписка

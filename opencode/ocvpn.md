@@ -13,9 +13,10 @@ description: Управление ocvpn — статус VPN, подписка, 
 3. Свой хост через VPN — спроси домен(ы) и выполни `ocvpn --add-host <домен>`; убрать — `ocvpn --rm-host <домен>`; показать список — `ocvpn --hosts`.
 4. Старт/стоп сервиса — Linux: `systemctl start|stop ocvpn`; macOS: `launchctl kickstart -k system/ai.opencode.ocvpn` / `launchctl bootout system/ai.opencode.ocvpn`.
 5. Очистка — `ocvpn --cleanup`.
+6. Обновление — `ocvpn --update` (последняя версия из GitHub).
 
 Правила:
 - Никогда не запускай интерактивный `sudo` (зависнет). Сначала `id -u`; если не root — `sudo -n true`.
   Есть права → команды напрямую или через `sudo -n`. Нет → только `ocvpn --status`/`--subs`/`--hosts` и инструкция «перезапустите opencode».
-- Подкоманды: `/ocvpn ip|new-ip`, `/ocvpn subs <URL>`, `/ocvpn add-host <домен>`, `/ocvpn rm-host <домен>`, `/ocvpn hosts`, `/ocvpn start|stop`, `/ocvpn cleanup`, `/ocvpn status`.
+- Подкоманды: `/ocvpn ip|new-ip`, `/ocvpn subs <URL>`, `/ocvpn add-host <домен>`, `/ocvpn rm-host <домен>`, `/ocvpn hosts`, `/ocvpn start|stop`, `/ocvpn cleanup`, `/ocvpn status`, `/ocvpn update`.
 - Ничего сверх перечисленного не делай.
